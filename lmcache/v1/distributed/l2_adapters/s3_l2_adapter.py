@@ -870,9 +870,21 @@ class S3L2Adapter(L2AdapterInterface):
     def _get_request(self, key_str: str, mem_obj: MemoryObj):
         req = self._make_request("GET", key_str)
         data_ptr = mem_obj.data_ptr
+        dst_size = mem_obj.get_size()
 
         def on_body(chunk, offset, **kwargs):
             # Write chunk into the caller-provided MemoryObj buffer.
+            # Reject any write that would fall outside the destination
+            # buffer (e.g. an oversized or stale remote object) before the
+            # memmove, so a size mismatch fails the GET cleanly instead of
+            # corrupting memory past ``mem_obj.get_size()``.
+            end = offset + len(chunk)
+            if offset < 0 or end > dst_size:
+                raise RuntimeError(
+                    f"S3 GET size mismatch for {key_str}: write "
+                    f"[{offset}, {end}) outside destination buffer of "
+                    f"{dst_size} bytes"
+                )
             ctypes.memmove(data_ptr + offset, chunk, len(chunk))
 
         def on_done(error=None, status_code=None, **kwargs):

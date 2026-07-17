@@ -299,6 +299,24 @@ class _FakeHttpRequest:
         self.body_stream = body_stream
 
 
+class _CaptureS3Request:
+    """S3Request substitute that captures the CRT callbacks without
+    dispatching them.
+
+    Lets a test grab the real ``on_body`` closure built by
+    ``_get_request`` and drive it manually with arbitrary chunk / offset
+    sequences (multi-chunk accumulation, exact boundary, negative
+    offset) — cases the auto-dispatching ``_FakeS3Request`` can't model
+    because it only ever fires a single ``on_body(data, 0)``.
+    """
+
+    def __init__(self, *, on_body=None, on_done=None, on_headers=None, **kwargs):
+        self.on_body = on_body
+        self.on_done = on_done
+        self.on_headers = on_headers
+        self.finished_future: ConcurrentFuture = ConcurrentFuture()
+
+
 @pytest.fixture(autouse=True)
 def patch_s3_request(monkeypatch):
     """Replace awscrt.s3.S3Request in the adapter with the in-memory fake.
@@ -344,6 +362,37 @@ def create_memory_obj(size: int = 16, fill_value: float = 1.0) -> TensorMemoryOb
         dtype=torch.float32,
         address=0,
         phy_size=size * 4,
+        fmt=MemoryFormat.KV_2LTD,
+        ref_count=1,
+    )
+    return TensorMemoryObj(raw_data, metadata, parent_allocator=None)
+
+
+_GUARD_BYTE = 0xAA
+
+
+def create_guarded_memory_obj(
+    logical_bytes: int,
+    physical_bytes: int,
+    guard: int = _GUARD_BYTE,
+) -> TensorMemoryObj:
+    """Build a MemoryObj whose logical ``get_size()`` (``logical_bytes``)
+    is smaller than its physical backing buffer (``physical_bytes``).
+
+    The extra ``[logical_bytes, physical_bytes)`` bytes are a guard
+    region pre-filled with ``guard``. A bounds-check regression that let
+    ``on_body`` write past ``get_size()`` would land in this owned guard
+    region (detected by asserting it stays ``guard``) instead of
+    corrupting unrelated process memory — mirroring the guard-region
+    harness attached to issue #3831.
+    """
+    assert physical_bytes >= logical_bytes
+    raw_data = torch.full((physical_bytes,), guard, dtype=torch.uint8)
+    metadata = MemoryObjMetadata(
+        shape=torch.Size([logical_bytes]),
+        dtype=torch.uint8,
+        address=0,
+        phy_size=physical_bytes,
         fmt=MemoryFormat.KV_2LTD,
         ref_count=1,
     )
@@ -900,3 +949,95 @@ class TestS3L2AdapterListKeys:
             page.entries[0].key
             == create_object_key(0, model_name="m").to_encoded_object_key()
         )
+
+
+# =============================================================================
+# GET bounds check (#3831)
+# =============================================================================
+
+
+def _capture_get_on_body(adapter, monkeypatch, mem_obj):
+    """Return the real ``on_body`` closure ``_get_request`` builds for
+    ``mem_obj``, captured (not dispatched) so a test can drive it with
+    arbitrary chunk/offset sequences."""
+    monkeypatch.setattr(s3mod.s3, "S3Request", _CaptureS3Request)
+    req = adapter._get_request("test-key", mem_obj)
+    return req.on_body
+
+
+class TestGetBoundsCheck:
+    """The GET ``on_body`` callback must never write outside the
+    destination ``MemoryObj`` (issue #3831): an oversized / stale remote
+    object has to fail the GET cleanly (bitmap bit left unset) instead of
+    corrupting memory past ``mem_obj.get_size()``.
+    """
+
+    def test_oversized_response_fails_load(self, adapter):
+        # End-to-end via the existing fake backend: a stored object whose
+        # body is larger than the destination's logical size must NOT be
+        # marked as loaded, and must not write past the logical bounds.
+        key = create_object_key(7)
+        _BACKEND.put(_object_key_to_string(key), b"X" * 32)  # 32 > 16 logical
+
+        dst = create_guarded_memory_obj(logical_bytes=16, physical_bytes=64)
+        tid = adapter.submit_load_task([key], [dst])
+        assert wait_for_event_fd(adapter.get_load_event_fd())
+
+        bm = adapter.query_load_result(tid)
+        assert bm is not None
+        assert bm.test(0) is False  # oversized object rejected, not loaded
+        # The callback raised before any memmove, so nothing was written.
+        assert all(b == _GUARD_BYTE for b in dst.raw_data.tolist())
+
+    def test_short_response_within_bounds_ok(self, adapter, monkeypatch):
+        # A body shorter than the destination is in-bounds and allowed;
+        # the bounds check only guards against writing *past* the buffer.
+        mem = create_guarded_memory_obj(logical_bytes=16, physical_bytes=32)
+        on_body = _capture_get_on_body(adapter, monkeypatch, mem)
+
+        on_body(b"\x07" * 8, 0)  # [0, 8) — no exception
+
+        buf = mem.raw_data.tolist()
+        assert buf[0:8] == [0x07] * 8
+        assert all(b == _GUARD_BYTE for b in buf[8:])  # remainder untouched
+
+    def test_exact_length_boundary_ok(self, adapter, monkeypatch):
+        # A write ending exactly at get_size() is allowed (``<=``); one
+        # byte past the boundary is rejected.
+        mem = create_guarded_memory_obj(logical_bytes=16, physical_bytes=32)
+        on_body = _capture_get_on_body(adapter, monkeypatch, mem)
+
+        on_body(b"\x09" * 16, 0)  # [0, 16) == get_size() — allowed
+        buf = mem.raw_data.tolist()
+        assert buf[0:16] == [0x09] * 16
+        assert all(b == _GUARD_BYTE for b in buf[16:])
+
+        with pytest.raises(RuntimeError, match="size mismatch"):
+            on_body(b"\x09", 16)  # [16, 17) — one past the boundary
+
+    def test_multi_chunk_accumulation_overflow_raises(self, adapter, monkeypatch):
+        # Individually in-bounds chunks that accumulate past get_size()
+        # must be rejected at the chunk that crosses the boundary, and no
+        # byte may spill into the guard region.
+        mem = create_guarded_memory_obj(logical_bytes=16, physical_bytes=32)
+        on_body = _capture_get_on_body(adapter, monkeypatch, mem)
+
+        on_body(b"\x01" * 8, 0)  # [0, 8)  — ok
+        on_body(b"\x02" * 8, 8)  # [8, 16) — ok, exactly fills
+        with pytest.raises(RuntimeError, match="size mismatch"):
+            on_body(b"\x03" * 8, 16)  # [16, 24) — overflow
+
+        buf = mem.raw_data.tolist()
+        assert buf[0:8] == [0x01] * 8
+        assert buf[8:16] == [0x02] * 8
+        assert all(b == _GUARD_BYTE for b in buf[16:])  # guard region intact
+
+    def test_negative_offset_raises(self, adapter, monkeypatch):
+        # A negative offset would memmove before the buffer start.
+        mem = create_guarded_memory_obj(logical_bytes=16, physical_bytes=32)
+        on_body = _capture_get_on_body(adapter, monkeypatch, mem)
+
+        with pytest.raises(RuntimeError, match="size mismatch"):
+            on_body(b"\x01" * 4, -1)
+
+        assert all(b == _GUARD_BYTE for b in mem.raw_data.tolist())
