@@ -188,9 +188,21 @@ def _object_key_to_string(key: ObjectKey) -> str:
     return base
 
 
-def _format_safe_path(key_str: str) -> str:
-    """URL-encode the object name to form a safe HTTP path."""
-    return "/" + url_quote(key_str)
+def _format_safe_path(
+    key_str: str,
+    use_path_style: bool = False,
+    bucket: Optional[str] = None,
+) -> str:
+    """URL-encode the object name to form a safe HTTP path.
+
+    When *use_path_style* is ``True`` the bucket is placed in the path
+    (``/<bucket>/<key>``) instead of the host, which is required by
+    MinIO and other S3-compatible stores.
+    """
+    encoded = url_quote(key_str)
+    if use_path_style:
+        return f"/{bucket}/{encoded}"
+    return "/" + encoded
 
 
 def _make_credentials_provider(
@@ -309,11 +321,12 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
     """Config for the S3 L2 adapter.
 
     Fields:
-    - s3_endpoint (str, required): bucket URL using **virtual-hosted**
-      style; accepts either ``"s3://<bucket>.<host>"`` or the bare
-      ``"<bucket>.<host>"`` form. The bucket name must be part of the
-      host because requests are signed and routed against this Host
-      header (path-style addressing is not supported).
+    - s3_endpoint (str, required): bucket URL. By default the endpoint
+      uses **virtual-hosted** style (bucket name in the host), e.g.
+      ``"s3://<bucket>.<host>"``. Set ``s3_use_path_style=True`` and
+      provide ``s3_bucket`` to use path-style addressing (bucket in the
+      request path), which is required for MinIO and other S3-compatible
+      stores.
     - s3_region (str, required): AWS region used for SigV4.
     - s3_num_io_threads (int): CRT IO threads.
     - s3_prefer_http2 (bool): ALPN negotiate to HTTP/2.
@@ -324,6 +337,10 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
     - aws_access_key_id / aws_secret_access_key (str): optional static
       credentials. When unset, credentials are resolved through boto3
       (env vars, profile, container, web-identity, IMDS).
+    - s3_use_path_style (bool): path-style addressing (bucket in path
+      instead of host). Default ``False``.
+    - s3_bucket (str, optional): bucket name, required when
+      ``s3_use_path_style=True``.
     - max_capacity_gb (float): aggregate capacity used by
       ``get_usage()``; ``0`` disables aggregate eviction
       (``usage_fraction == -1.0``).
@@ -339,6 +356,8 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         disable_tls: bool = False,
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
+        s3_use_path_style: bool = False,
+        s3_bucket: Optional[str] = None,
         max_capacity_gb: float = 0.0,
     ):
         self.s3_endpoint = s3_endpoint
@@ -349,6 +368,8 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         self.disable_tls = disable_tls
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
+        self.s3_use_path_style = s3_use_path_style
+        self.s3_bucket = s3_bucket
         self.max_capacity_gb = max_capacity_gb
 
     @classmethod
@@ -384,6 +405,15 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_cap, (int, float)) or isinstance(max_cap, bool):
             raise ValueError("max_capacity_gb must be a number")
 
+        s3_use_path_style = d.get("s3_use_path_style", False)
+        if not isinstance(s3_use_path_style, bool):
+            raise ValueError("s3_use_path_style must be a boolean")
+        s3_bucket = d.get("s3_bucket", None)
+        if s3_bucket is not None and not isinstance(s3_bucket, str):
+            raise ValueError("s3_bucket must be a string")
+        if s3_use_path_style and not s3_bucket:
+            raise ValueError("s3_bucket is required when s3_use_path_style=True")
+
         cfg = cls(
             s3_endpoint=endpoint,
             s3_region=region,
@@ -393,6 +423,8 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             disable_tls=_bool("disable_tls", False),
             aws_access_key_id=_opt_str("aws_access_key_id"),
             aws_secret_access_key=_opt_str("aws_secret_access_key"),
+            s3_use_path_style=s3_use_path_style,
+            s3_bucket=s3_bucket,
             max_capacity_gb=float(max_cap),
         )
         cfg.eviction_config = cls._parse_eviction_config(d)
@@ -402,7 +434,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
     def help(cls) -> str:
         return (
             "S3 L2 adapter config fields:\n"
-            "- s3_endpoint (str, required): virtual-hosted bucket URL "
+            "- s3_endpoint (str, required): bucket URL "
             "('s3://<bucket>.<host>' or '<bucket>.<host>')\n"
             "- s3_region (str, required): AWS region for SigV4\n"
             "- s3_num_io_threads (int): CRT IO threads (default 64)\n"
@@ -411,6 +443,8 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             "- disable_tls (bool): bypass TLS on the bucket data plane\n"
             "- aws_access_key_id / aws_secret_access_key (str): static creds; "
             "when unset, boto3 resolves credentials\n"
+            "- s3_use_path_style (bool): path-style addressing (default false)\n"
+            "- s3_bucket (str): bucket name, required with path-style\n"
             "- max_capacity_gb (float): capacity for get_usage (0 = disabled)\n"
             "- eviction (dict): optional, see L2AdapterConfigBase"
         )
@@ -452,6 +486,8 @@ class S3L2Adapter(L2AdapterInterface):
         self._endpoint = endpoint
         self._region = config.s3_region
         self._enable_s3express = config.s3_enable_s3express
+        self._use_path_style = config.s3_use_path_style
+        self._bucket = config.s3_bucket
 
         # awscrt client setup (mirrors s3_connector.py:103-153)
         event_loop_group = io.EventLoopGroup(config.s3_num_io_threads)
@@ -838,7 +874,11 @@ class S3L2Adapter(L2AdapterInterface):
                 headers.add(k, v)
         return HttpRequest(
             method,
-            _format_safe_path(key_str),
+            _format_safe_path(
+                key_str,
+                use_path_style=self._use_path_style,
+                bucket=self._bucket,
+            ),
             headers,
             body_stream=body_stream,
         )
@@ -973,7 +1013,10 @@ class S3L2Adapter(L2AdapterInterface):
             params.append(("continuation-token", continuation_token))
         # urlencode handles percent-escaping of values (continuation
         # tokens are typically base64 with ``+``/``/``/``=`` chars).
-        path = "/?" + urlencode(params, quote_via=url_quote)
+        if self._use_path_style:
+            path = f"/{self._bucket}/?" + urlencode(params, quote_via=url_quote)
+        else:
+            path = "/?" + urlencode(params, quote_via=url_quote)
 
         headers = HttpHeaders()
         headers.add("Host", self._endpoint)

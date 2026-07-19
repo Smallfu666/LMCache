@@ -22,6 +22,25 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 logger = init_logger(__name__)
 
 
+def _format_s3_path(
+    key_str: str,
+    use_path_style: bool = False,
+    bucket: Optional[str] = None,
+) -> str:
+    """Build an S3 HTTP path for *key_str*.
+
+    When *use_path_style* is ``True`` the bucket name is placed in the
+    path (``/<bucket>/<flattened-key>``), which is required by MinIO
+    and other S3-compatible stores.  Otherwise the path is just
+    ``/<flattened-key>`` (virtual-hosted addressing, the default).
+    """
+    flat_key_str = key_str.replace("/", "_")
+    encoded = url_quote(flat_key_str)
+    if use_path_style:
+        return f"/{bucket}/{encoded}"
+    return "/" + encoded
+
+
 class Priorities(IntEnum):
     PEEK = auto()
     PREFETCH = auto()
@@ -82,6 +101,8 @@ class S3Connector(RemoteConnector):
         disable_tls: bool,
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
+        s3_use_path_style: bool = False,
+        s3_bucket: Optional[str] = None,
     ):
         # initialize base class, which includes some common attributes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -89,9 +110,14 @@ class S3Connector(RemoteConnector):
         if not s3_endpoint.startswith("s3://"):
             raise ValueError("S3 url must start with 's3://'")
 
+        if s3_use_path_style and not s3_bucket:
+            raise ValueError("s3_bucket is required when s3_use_path_style=True")
+
         self.s3_part_size = self.full_chunk_size_bytes
 
         self.s3_endpoint = s3_endpoint.removeprefix("s3://")
+        self.s3_use_path_style = s3_use_path_style
+        self.s3_bucket = s3_bucket
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
@@ -171,9 +197,14 @@ class S3Connector(RemoteConnector):
         Generate a safe HTTP path for the S3 key.
         Flattens the key by replacing slashes with underscores and URL-encodes
         any special characters.
+        When *s3_use_path_style* is enabled the bucket name is included in
+        the path prefix.
         """
-        flat_key_str = key_str.replace("/", "_")
-        return "/" + url_quote(flat_key_str)
+        return _format_s3_path(
+            key_str,
+            use_path_style=self.s3_use_path_style,
+            bucket=self.s3_bucket,
+        )
 
     # TODO(Jiayi): optimize this with async
     def _get_object_size(self, key_str: str) -> int:
