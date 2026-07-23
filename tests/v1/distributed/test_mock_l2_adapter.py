@@ -886,3 +886,271 @@ class TestEvictionInterface:
 
         assert len(l1.stored) == 1
         assert len(l2.stored) == 1
+
+
+# =============================================================================
+# Fixed Service Latency Tests
+# =============================================================================
+
+_LATENCY_MS = 200.0
+# Loose lower bound for wall-clock assertions: the adapter sleeps at
+# least the configured latency, but the test measures with a different
+# clock and includes thread handoff, so allow 10% slack downward.
+_LATENCY_LOWER_S = _LATENCY_MS / 1000.0 * 0.9
+
+
+@pytest.fixture
+def latency_adapter():
+    """Adapter with fixed per-operation latencies and fast bandwidth.
+
+    Bandwidth is set high so the bandwidth-proportional delay is
+    negligible and timing assertions isolate the fixed latency term.
+    """
+    config = MockL2AdapterConfig(
+        max_size_gb=0.001,  # 1 MB
+        mock_bandwidth_gb=1000.0,
+        mock_store_latency_ms=_LATENCY_MS,
+        mock_lookup_latency_ms=_LATENCY_MS,
+        mock_load_latency_ms=_LATENCY_MS,
+    )
+    adapter = MockL2Adapter(config)
+    yield adapter
+    adapter.close()
+
+
+class TestFixedLatencyConfig:
+    """Test config parsing and validation of the fixed-latency fields."""
+
+    def test_latency_fields_default_to_zero(self):
+        """Omitting the latency kwargs should leave all latencies at 0."""
+        config = MockL2AdapterConfig(max_size_gb=1.0, mock_bandwidth_gb=1.0)
+        assert config.mock_store_latency_ms == 0.0
+        assert config.mock_lookup_latency_ms == 0.0
+        assert config.mock_load_latency_ms == 0.0
+
+    def test_from_dict_accepts_latency_fields(self):
+        """from_dict should parse all three latency fields."""
+        config = MockL2AdapterConfig.from_dict(
+            {
+                "max_size_gb": 1.0,
+                "mock_bandwidth_gb": 1.0,
+                "mock_store_latency_ms": 5.0,
+                "mock_lookup_latency_ms": 2,
+                "mock_load_latency_ms": 7.5,
+            }
+        )
+        assert config.mock_store_latency_ms == 5.0
+        assert config.mock_lookup_latency_ms == 2.0
+        assert config.mock_load_latency_ms == 7.5
+
+    def test_from_dict_defaults_missing_latency_fields_to_zero(self):
+        """from_dict without latency fields should default them to 0."""
+        config = MockL2AdapterConfig.from_dict(
+            {"max_size_gb": 1.0, "mock_bandwidth_gb": 1.0}
+        )
+        assert config.mock_store_latency_ms == 0.0
+        assert config.mock_lookup_latency_ms == 0.0
+        assert config.mock_load_latency_ms == 0.0
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "mock_store_latency_ms",
+            "mock_lookup_latency_ms",
+            "mock_load_latency_ms",
+        ],
+    )
+    def test_from_dict_rejects_negative_latency(self, field):
+        """Negative latency values should raise ValueError."""
+        with pytest.raises(ValueError, match=field):
+            MockL2AdapterConfig.from_dict(
+                {"max_size_gb": 1.0, "mock_bandwidth_gb": 1.0, field: -1.0}
+            )
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "mock_store_latency_ms",
+            "mock_lookup_latency_ms",
+            "mock_load_latency_ms",
+        ],
+    )
+    def test_from_dict_rejects_non_numeric_latency(self, field):
+        """Non-numeric latency values should raise ValueError."""
+        with pytest.raises(ValueError, match=field):
+            MockL2AdapterConfig.from_dict(
+                {"max_size_gb": 1.0, "mock_bandwidth_gb": 1.0, field: "fast"}
+            )
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "mock_store_latency_ms",
+            "mock_lookup_latency_ms",
+            "mock_load_latency_ms",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "value",
+        [float("nan"), float("inf"), float("-inf"), True],
+        ids=["nan", "inf", "-inf", "bool"],
+    )
+    def test_from_dict_rejects_non_finite_or_bool_latency(self, field, value):
+        """NaN, +/-Infinity, and bool latency values should raise ValueError."""
+        with pytest.raises(ValueError, match=field):
+            MockL2AdapterConfig.from_dict(
+                {"max_size_gb": 1.0, "mock_bandwidth_gb": 1.0, field: value}
+            )
+
+    def test_help_documents_latency_fields(self):
+        """help() should document all three latency fields."""
+        text = MockL2AdapterConfig.help()
+        assert "mock_store_latency_ms" in text
+        assert "mock_lookup_latency_ms" in text
+        assert "mock_load_latency_ms" in text
+
+
+class TestFixedLatencySimulation:
+    """Test that fixed latencies delay task completion per operation."""
+
+    def test_store_completion_delayed_by_fixed_latency(self, latency_adapter):
+        """Store completion should arrive no earlier than the fixed latency."""
+        key = create_object_key(1)
+        obj = create_memory_obj(size=100)
+        store_fd = latency_adapter.get_store_event_fd()
+
+        start_time = time.perf_counter()
+        latency_adapter.submit_store_task([key], [obj])
+
+        assert wait_for_event_fd(store_fd, timeout=10.0)
+        elapsed = time.perf_counter() - start_time
+        assert elapsed >= _LATENCY_LOWER_S
+
+    def test_lookup_completion_delayed_by_fixed_latency(self, latency_adapter):
+        """Lookup completion should arrive no earlier than the fixed latency."""
+        key = create_object_key(1)
+        lookup_fd = latency_adapter.get_lookup_and_lock_event_fd()
+
+        start_time = time.perf_counter()
+        latency_adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+
+        assert wait_for_event_fd(lookup_fd, timeout=10.0)
+        elapsed = time.perf_counter() - start_time
+        assert elapsed >= _LATENCY_LOWER_S
+
+    def test_load_completion_delayed_by_fixed_latency(self, latency_adapter):
+        """Load completion should arrive no earlier than the fixed latency."""
+        key = create_object_key(1)
+        store_obj = create_memory_obj(size=100, fill_value=3.0)
+        load_obj = create_memory_obj(size=100, fill_value=0.0)
+        store_fd = latency_adapter.get_store_event_fd()
+        load_fd = latency_adapter.get_load_event_fd()
+
+        latency_adapter.submit_store_task([key], [store_obj])
+        wait_for_event_fd(store_fd, timeout=10.0)
+        latency_adapter.pop_completed_store_tasks()
+
+        start_time = time.perf_counter()
+        latency_adapter.submit_load_task([key], [load_obj])
+
+        assert wait_for_event_fd(load_fd, timeout=10.0)
+        elapsed = time.perf_counter() - start_time
+        assert elapsed >= _LATENCY_LOWER_S
+
+    def test_lookup_result_correct_after_delay(self, latency_adapter):
+        """A delayed lookup should still return the correct bitmap."""
+        key = create_object_key(1)
+        obj = create_memory_obj(size=100)
+        store_fd = latency_adapter.get_store_event_fd()
+        lookup_fd = latency_adapter.get_lookup_and_lock_event_fd()
+
+        latency_adapter.submit_store_task([key], [obj])
+        wait_for_event_fd(store_fd, timeout=10.0)
+        latency_adapter.pop_completed_store_tasks()
+
+        missing_key = create_object_key(999)
+        task_id = latency_adapter.submit_lookup_and_lock_task(
+            [key, missing_key], _EMPTY_LAYOUT
+        )
+        wait_for_event_fd(lookup_fd, timeout=10.0)
+
+        bitmap = latency_adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None
+        assert bitmap.test(0) is True
+        assert bitmap.test(1) is False
+
+    def test_store_latency_applies_to_duplicate_store(self, latency_adapter):
+        """A duplicate (no-op) store still pays the fixed round-trip latency."""
+        key = create_object_key(1)
+        obj = create_memory_obj(size=100)
+        store_fd = latency_adapter.get_store_event_fd()
+
+        latency_adapter.submit_store_task([key], [obj])
+        wait_for_event_fd(store_fd, timeout=10.0)
+        latency_adapter.pop_completed_store_tasks()
+
+        start_time = time.perf_counter()
+        latency_adapter.submit_store_task([key], [obj])
+
+        assert wait_for_event_fd(store_fd, timeout=10.0)
+        elapsed = time.perf_counter() - start_time
+        assert elapsed >= _LATENCY_LOWER_S
+
+    def test_zero_latency_lookup_completes_and_returns_result(self, adapter):
+        """With default (zero) latency, lookup completes and returns a result."""
+        key = create_object_key(1)
+        lookup_fd = adapter.get_lookup_and_lock_event_fd()
+
+        task_id = adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+
+        assert wait_for_event_fd(lookup_fd, timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id) is not None
+
+    def test_lookup_result_not_visible_before_latency(self, latency_adapter):
+        """The lookup result must not be published before the latency expires."""
+        key = create_object_key(1)
+        lookup_fd = latency_adapter.get_lookup_and_lock_event_fd()
+
+        task_id = latency_adapter.submit_lookup_and_lock_task([key], _EMPTY_LAYOUT)
+
+        # Queried immediately after submit, well before the 200 ms
+        # latency expires, the result must not be visible yet.
+        assert latency_adapter.query_lookup_and_lock_result(task_id) is None
+
+        assert wait_for_event_fd(lookup_fd, timeout=10.0)
+        assert latency_adapter.query_lookup_and_lock_result(task_id) is not None
+
+    def test_lookup_all_miss_pays_fixed_latency(self, latency_adapter):
+        """An all-miss lookup still pays the fixed round-trip latency."""
+        missing_key = create_object_key(999)
+        lookup_fd = latency_adapter.get_lookup_and_lock_event_fd()
+
+        start_time = time.perf_counter()
+        task_id = latency_adapter.submit_lookup_and_lock_task(
+            [missing_key], _EMPTY_LAYOUT
+        )
+
+        assert wait_for_event_fd(lookup_fd, timeout=10.0)
+        elapsed = time.perf_counter() - start_time
+        assert elapsed >= _LATENCY_LOWER_S
+
+        bitmap = latency_adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None
+        assert bitmap.test(0) is False
+
+    def test_load_all_miss_pays_fixed_latency(self, latency_adapter):
+        """An all-miss load still pays the fixed round-trip latency."""
+        missing_key = create_object_key(999)
+        load_obj = create_memory_obj(size=100, fill_value=0.0)
+        load_fd = latency_adapter.get_load_event_fd()
+
+        start_time = time.perf_counter()
+        task_id = latency_adapter.submit_load_task([missing_key], [load_obj])
+
+        assert wait_for_event_fd(load_fd, timeout=10.0)
+        elapsed = time.perf_counter() - start_time
+        assert elapsed >= _LATENCY_LOWER_S
+
+        bitmap = latency_adapter.query_load_result(task_id)
+        assert bitmap is not None
+        assert bitmap.test(0) is False

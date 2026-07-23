@@ -8,6 +8,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 import asyncio
 import copy
+import math
 import threading
 import time
 
@@ -66,15 +67,36 @@ class MockL2AdapterConfig(L2AdapterConfigBase):
     Fields:
     - max_size_gb: maximum size in GB.
     - mock_bandwidth_gb: simulated bandwidth in GB/sec.
+    - mock_store_latency_ms: fixed per-task service latency added to
+      every store task, in milliseconds (0 = disabled).
+    - mock_lookup_latency_ms: fixed per-task service latency added to
+      every lookup_and_lock task, in milliseconds (0 = disabled).
+    - mock_load_latency_ms: fixed per-task service latency added to
+      every load task, in milliseconds (0 = disabled).
+
+    The fixed latencies model the size-independent cost of a real
+    backend (RPC round trip, metadata service, object-store HEAD),
+    while ``mock_bandwidth_gb`` models the size-proportional transfer
+    cost. Together they define the *minimum modeled service time* of a
+    task: store and load complete no earlier than
+    ``submit + latency + bytes / bandwidth``, with adapter-side work
+    already performed counting toward that target; lookup_and_lock
+    simulates the fixed latency before processing the request.
     """
 
     def __init__(
         self,
         max_size_gb: float,
         mock_bandwidth_gb: float,
+        mock_store_latency_ms: float = 0.0,
+        mock_lookup_latency_ms: float = 0.0,
+        mock_load_latency_ms: float = 0.0,
     ):
         self.max_size_gb = max_size_gb
         self.mock_bandwidth_gb = mock_bandwidth_gb
+        self.mock_store_latency_ms = mock_store_latency_ms
+        self.mock_lookup_latency_ms = mock_lookup_latency_ms
+        self.mock_load_latency_ms = mock_load_latency_ms
 
     @classmethod
     def from_dict(cls, d: dict) -> "MockL2AdapterConfig":
@@ -86,9 +108,26 @@ class MockL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(mock_bandwidth_gb, (int, float)) or mock_bandwidth_gb <= 0:
             raise ValueError("mock_bandwidth_gb must be a positive number")
 
+        latencies: dict[str, float] = {}
+        for field in (
+            "mock_store_latency_ms",
+            "mock_lookup_latency_ms",
+            "mock_load_latency_ms",
+        ):
+            value = d.get(field, 0.0)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{field} must be a finite non-negative number")
+            latencies[field] = float(value)
+
         return cls(
             max_size_gb=max_size_gb,
             mock_bandwidth_gb=mock_bandwidth_gb,
+            **latencies,
         )
 
     @classmethod
@@ -98,7 +137,13 @@ class MockL2AdapterConfig(L2AdapterConfigBase):
             "- max_size_gb (float): maximum size of "
             "the adapter in GB (required, >0)\n"
             "- mock_bandwidth_gb (float): simulated "
-            "bandwidth in GB/sec (required, >0)"
+            "bandwidth in GB/sec (required, >0)\n"
+            "- mock_store_latency_ms (float): fixed store service "
+            "latency in ms (optional, >=0, default 0)\n"
+            "- mock_lookup_latency_ms (float): fixed lookup_and_lock "
+            "service latency in ms (optional, >=0, default 0)\n"
+            "- mock_load_latency_ms (float): fixed load service "
+            "latency in ms (optional, >=0, default 0)"
         )
 
 
@@ -107,7 +152,8 @@ class MockL2AdapterConfig(L2AdapterConfigBase):
 
 class MockL2Adapter(L2AdapterInterface):
     """
-    A mock-up L2 adapter with a specific RAM size and mocked bandwidth
+    A mock-up L2 adapter with a specific RAM size, mocked bandwidth,
+    and optional fixed per-operation service latencies.
     """
 
     def __init__(self, config: MockL2AdapterConfig):
@@ -115,6 +161,9 @@ class MockL2Adapter(L2AdapterInterface):
         super().__init__(max_capacity_bytes=max_capacity_bytes)
         self._config = config
         self._bandwidth_byte_ps = int(config.mock_bandwidth_gb * (1024**3))
+        self._store_latency_s = config.mock_store_latency_ms / 1000.0
+        self._lookup_latency_s = config.mock_lookup_latency_ms / 1000.0
+        self._load_latency_s = config.mock_load_latency_ms / 1000.0
 
         self._store_efd = create_event_notifier()
         self._lookup_efd = create_event_notifier()
@@ -162,8 +211,15 @@ class MockL2Adapter(L2AdapterInterface):
         Submit a store task to store a batch of memory objects associated with
         a batch of keys.
 
-        For the mock adapter, the store operation simulates bandwidth-limited
-        transfer by delaying completion based on object size and configured bandwidth.
+        For the mock adapter, the store operation simulates a backend
+        service call: completion is delayed until the minimum modeled
+        service time ``mock_store_latency_ms + total_bytes /
+        mock_bandwidth_gb`` is reached, with the wall time already spent
+        copying counting toward it. The fixed latency applies to the
+        task as a whole (one simulated round trip per submitted batch),
+        even when no bytes are actually written (duplicate or
+        capacity-skipped keys), mirroring a real backend that still
+        pays the request round trip for no-op writes.
 
         Args:
             keys (list[ObjectKey]): the list of keys to be stored.
@@ -203,7 +259,9 @@ class MockL2Adapter(L2AdapterInterface):
             task_id = self._get_next_task_id()
 
         # Schedule the lookup operation in the event loop thread
-        self._loop.call_soon_threadsafe(self._execute_lookup_in_the_loop, keys, task_id)
+        asyncio.run_coroutine_threadsafe(
+            self._execute_lookup_in_the_loop(keys, task_id), self._loop
+        )
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -338,6 +396,38 @@ class MockL2Adapter(L2AdapterInterface):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
+    def _remaining_service_delay(
+        self,
+        started_at: float,
+        fixed_latency_s: float,
+        total_bytes: int,
+    ) -> float:
+        """Return the remaining sleep needed to reach the modeled service time.
+
+        The minimum modeled service time of a task is
+        ``fixed_latency_s + total_bytes / bandwidth``. Wall time already
+        spent doing the adapter-side work (measured from ``started_at``
+        with ``time.perf_counter``) counts toward that target, consistent
+        with the pre-existing bandwidth-only model.
+
+        Args:
+            started_at: ``time.perf_counter()`` timestamp taken when the
+                task body started executing.
+            fixed_latency_s: configured fixed service latency in seconds.
+            total_bytes: bytes actually transferred by the task.
+
+        Returns:
+            float: non-negative remaining delay in seconds.
+        """
+        transfer_s = (
+            total_bytes / self._bandwidth_byte_ps
+            if self._bandwidth_byte_ps > 0
+            else 0.0
+        )
+        modeled_s = fixed_latency_s + transfer_s
+        elapsed_s = time.perf_counter() - started_at
+        return max(modeled_s - elapsed_s, 0.0)
+
     def _get_next_task_id(self) -> L2TaskId:
         """Get the next task ID and increment the counter."""
         task_id = self._next_task_id
@@ -424,16 +514,12 @@ class MockL2Adapter(L2AdapterInterface):
         except Exception:
             success = False
 
-        # Calculate delay based on bandwidth simulation
-        end = time.perf_counter()
-        delay_seconds = (
-            total_bytes / self._bandwidth_byte_ps if self._bandwidth_byte_ps > 0 else 0
+        # Delay completion to the minimum modeled service time (fixed
+        # per-task latency + bandwidth-limited transfer time, less the
+        # wall time already spent doing the copy).
+        await asyncio.sleep(
+            self._remaining_service_delay(start, self._store_latency_s, total_bytes)
         )
-        delay_seconds -= end - start
-        delay_seconds = max(delay_seconds, 0)  # Ensure non-negative delay
-
-        # Schedule completion coroutine on the event loop
-        await asyncio.sleep(delay_seconds)
         with self._lock:
             # ``total_bytes`` counts only objects actually written into
             # ``self._memory_objects`` — duplicates and capacity-skipped
@@ -449,9 +535,22 @@ class MockL2Adapter(L2AdapterInterface):
         """Signal the lookup event fd to notify completion."""
         self._lookup_efd.notify()
 
-    def _execute_lookup_in_the_loop(
+    async def _execute_lookup_in_the_loop(
         self, keys: list[ObjectKey], task_id: L2TaskId
     ) -> None:
+        """
+        Execute the lookup_and_lock operation in the event loop thread.
+
+        The configured ``mock_lookup_latency_ms`` is simulated *before*
+        the lookup body runs, modeling a backend that processes the
+        request after a service delay. The existence check, lock
+        acquisition, and result publication then run in a single
+        event-loop segment with no ``await`` in between, so the original
+        lookup lifecycle is preserved: locks are never held while the
+        result is still invisible to the caller.
+        """
+        if self._lookup_latency_s > 0:
+            await asyncio.sleep(self._lookup_latency_s)
         bitmap = Bitmap(len(keys))
         for i, key in enumerate(keys):
             if key not in self._memory_objects:
@@ -495,14 +594,12 @@ class MockL2Adapter(L2AdapterInterface):
             total_bytes += obj.get_size()
             accessed_keys.append(key)
 
-        end = time.perf_counter()
-        delay_seconds = (
-            total_bytes / self._bandwidth_byte_ps if self._bandwidth_byte_ps > 0 else 0
+        # Delay completion to the minimum modeled service time. As with
+        # store, the fixed latency applies once per submitted task even
+        # when no keys are found.
+        await asyncio.sleep(
+            self._remaining_service_delay(start, self._load_latency_s, total_bytes)
         )
-        delay_seconds -= end - start
-        delay_seconds = max(delay_seconds, 0)  # Ensure non-negative delay
-
-        await asyncio.sleep(delay_seconds)
         if accessed_keys:
             self._notify_keys_accessed(accessed_keys)
         with self._lock:
