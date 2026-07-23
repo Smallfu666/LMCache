@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from itertools import islice
 from typing import Generator, Sequence
+import os
 import threading
 import time
 
@@ -53,6 +54,15 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+# Investigation instrumentation for issue #4179 (object-group L2 retrieve size
+# mismatch). Gated behind LMCACHE_DEBUG_OBJECT_GROUP_SIZES; no-op otherwise.
+_DEBUG_OG_SIZES = os.environ.get("LMCACHE_DEBUG_OBJECT_GROUP_SIZES", "0") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
 _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
     lmc_ops, "execute_object_group_transfer"
 )
@@ -332,6 +342,35 @@ def _run_object_group_transfer_plan(
             "skipping the first %d objects in the batch",
             object_group_id,
             num_objects_to_skip,
+        )
+
+    if _DEBUG_OG_SIZES:
+        og_buffer_nbytes = object_group_buffers[0].nbytes if object_group_buffers else 0
+        per_kg = {
+            kg: {
+                "blocks_per_chunk": blocks_per_chunk_by_kg[kg],
+                "blocks_per_window": blocks_per_window_by_kg[kg],
+                "slots_per_chunk_in_sw": kv_groups_manager.get_slots_per_chunk_in_sw(kg),
+                "subchunk_sw_size_tokens": (
+                    kv_groups_manager.get_subchunk_sw_size_tokens(kg)
+                ),
+            }
+            for kg in kernel_group_ids
+        }
+        logger.info(
+            "[#4179] object_group=%d dir=%s chunk=%d n_memory_objs=%d "
+            "num_objects_to_skip=%d is_full_attention=%s num_chunks_in_sw=%s "
+            "og_staging_buffer_nbytes=%d kernel_group_ids=%s per_kg=%s",
+            object_group_id,
+            "H2D" if is_h2d else "D2H",
+            lmcache_chunk_size,
+            len(memory_objs),
+            num_objects_to_skip,
+            attn_desc.is_full_attention(object_group_id),
+            attn_desc.num_chunks_in_sw[object_group_id],
+            og_buffer_nbytes,
+            list(kernel_group_ids),
+            per_kg,
         )
 
     # --- Walk the batches in order, emitting staging + launch work per step ---
@@ -1261,6 +1300,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             return event.ipc_handle(), False
 
                         total_bytes += sum(mo.get_size() for mo in memory_objs)
+
+                        if _DEBUG_OG_SIZES:
+                            logger.info(
+                                "[#4179] RETRIEVE request_id=%s obj_group=%d "
+                                "n_keys=%d loaded_sizes=%s keys=%s",
+                                key.request_id,
+                                obj_group_id,
+                                len(obj_keys),
+                                [mo.get_size() for mo in memory_objs],
+                                [str(k) for k in obj_keys],
+                            )
 
                         transfer_kv_per_object_group(
                             cache_context,

@@ -1,15 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Sequence
+import os
 
 # Third Party
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.gpu_connector.gds_context import SlabDirection, get_gds_context
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import GDSMemoryObject, MemoryObj
 import lmcache.c_ops as lmc_ops
+
+logger = init_logger(__name__)
+
+# Investigation instrumentation for issue #4179 (object-group L2 retrieve size
+# mismatch). Gated behind LMCACHE_DEBUG_OBJECT_GROUP_SIZES so it is a no-op in
+# normal runs. NOT intended for upstream merge in this form.
+_DEBUG_OG_SIZES = os.environ.get("LMCACHE_DEBUG_OBJECT_GROUP_SIZES", "0") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
 
 
 # Helper functions
@@ -120,13 +134,35 @@ def build_staging_copies(
             or its size does not match its GPU buffer.
     """
     copies: list["lmc_ops.StagingCopy"] = []
-    for memory_obj, gpu_buffer in zip(memory_objs, gpu_buffers, strict=True):
+    for idx, (memory_obj, gpu_buffer) in enumerate(
+        zip(memory_objs, gpu_buffers, strict=True)
+    ):
         if memory_obj.raw_tensor is None:
             raise ValueError(
                 "memory_obj.raw_tensor is None; ensure the MemoryObj has been "
                 "allocated."
             )
         mem_obj_size = memory_obj.get_size()
+        if _DEBUG_OG_SIZES:
+            rt = memory_obj.raw_tensor
+            logger.info(
+                "[#4179] build_staging_copies is_h2d=%s idx=%d "
+                "mem_obj_size=%d gpu_buffer_nbytes=%d match=%s | "
+                "memobj: fmt=%s shape=%s dtype=%s raw_nbytes=%s raw_shape=%s | "
+                "gpu_buffer: shape=%s dtype=%s",
+                is_h2d,
+                idx,
+                mem_obj_size,
+                gpu_buffer.nbytes,
+                mem_obj_size == gpu_buffer.nbytes,
+                getattr(memory_obj.meta, "fmt", "?"),
+                getattr(memory_obj.meta, "shape", "?"),
+                getattr(memory_obj.meta, "dtype", "?"),
+                rt.nbytes if rt is not None else None,
+                tuple(rt.shape) if rt is not None else None,
+                tuple(gpu_buffer.shape),
+                gpu_buffer.dtype,
+            )
         if mem_obj_size != gpu_buffer.nbytes:
             raise ValueError(
                 f"Size mismatch: memory_obj nbytes={mem_obj_size}, "
