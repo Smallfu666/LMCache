@@ -291,3 +291,4 @@ Configuration
    metrics
    logs
    traces
+   /mp/troubleshooting
