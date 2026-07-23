@@ -754,6 +754,24 @@ Options
        ``engine_driven`` forces the worker-side gather/scatter path
        (``REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT`` + ``PREPARE``/``COMMIT``).
        ``auto`` maps gpu→lmcache_driven and cpu→engine_driven.
+       The engine-driven data path is currently supported **only** for the
+       historical ``--op pair --concurrency 1`` sanity test (its
+       scatter/gather self-check is a discriminating oracle only there),
+       and only on ``--mode cpu`` with ``--checksum on`` — that self-check
+       is the sole oracle that can catch a dropped copy or an empty commit
+       payload, so the data path may not run unverified (and
+       ``--mode gpu --transfer-mode engine_driven`` is refused). A
+       throughput op or ``--concurrency > 1`` on the data path is refused
+       before any connection opens. Use the handle path (``--mode gpu`` or
+       ``--transfer-mode lmcache_driven`` on cpu) for those. Engine-driven
+       concurrency / throughput is a deferred follow-up.
+       Even within that guard, engine-driven N=1 pair is a **compatibility
+       sanity path**, not a general one: the validated configuration is CPU
+       POSIX-SHM with a single homogeneous classical (5D) KV group. Other
+       layouts (MLA / 4D or heterogeneous groups, or a no-SHM pickle
+       fallback) may fail closed — the checksum catches any silent wrong
+       result, but they are outside this path's tested scope. Use the
+       handle path for those.
    * - ``--num-tokens N``
      - ``512``
      - Tokens per synthetic request.
@@ -772,7 +790,68 @@ Options
        loop runs forever.
    * - ``--interval SECS``
      - ``0.5``
-     - Delay between successive sub-passes.
+     - Delay between successive sub-passes (``pair`` / ``retrieve-only``
+       only; the throughput modes do not sleep between requests).
+   * - ``--concurrency N``
+     - ``1``
+     - Number of concurrent worker threads, each with its own MP client
+       and registered context. Each worker drives a disjoint sequence
+       range and its own band-size KV cache (see
+       `Concurrency and workload`_). ``1`` preserves the historical
+       single-client request topology and default workload semantics.
+   * - ``--op {pair,store-only,retrieve-only}``
+     - ``pair``
+     - Workload shape. ``pair`` is the historical cold-STORE + warm-RETRIEVE
+       pass with checksum comparison. ``store-only`` runs a single cold
+       STORE pass (write throughput). ``retrieve-only`` pre-warms the cache
+       with a STORE pass, then measures a warm RETRIEVE pass (read
+       throughput).
+   * - ``--requests M``
+     - *(unset)*
+     - Requests **per worker**. When set, each worker issues exactly ``M``
+       requests, so the run processes ``concurrency * M`` distinct
+       sequences. Mutually exclusive with ``--end``.
+   * - ``--prefetch-poll-interval SECS``
+     - ``0.05``
+     - Seconds between ``QUERY_PREFETCH_STATUS`` polls while waiting for a
+       warm LOOKUP to become ready. Must be finite and ``>= 0``. The 50 ms
+       default dominates the per-request latency floor at high concurrency;
+       lower it to observe the server's true prefetch latency. The
+       inter-poll sleep budget is ``50 * interval``; the total LOOKUP wall
+       time also includes the per-poll RPC latency and, in the worst case,
+       the RPC timeout.
+   * - ``--checksum {auto,on,off}``
+     - ``auto``
+     - Checksum verification mode. ``auto`` enables checksums in ``pair``
+       mode and disables them in the throughput modes so a run is not
+       skewed by the per-request checksum round-trip. ``on`` / ``off``
+       force the choice, but ``on`` is only valid with ``--op pair``:
+       the throughput modes have no checksum contract yet (a follow-up
+       will add an independent read-back verification pass), so
+       ``--op store-only``/``retrieve-only`` with ``--checksum on`` is
+       rejected.
+       In handle mode (``lmcache_driven``) the warm pass zero-fills the
+       client's shared KV pages before the RETRIEVE, so the post-retrieve
+       server-side digest can only match the cold digest if the server
+       actually wrote the bytes back — a silent no-op RETRIEVE fails the
+       comparison instead of trivially passing it.
+   * - ``--server-max-gpu-workers M``
+     - *(unset)*
+     - The AFFINITY transfer-pool size the target server was started with.
+       The server sizes that pool from its ``max_gpu_workers`` setting
+       (``add_affinity_thread_pool(max_workers=max_gpu_workers)``) and does
+       not expose it over RPC, so supply it explicitly; it is recorded in
+       the results config section. **Required when** ``--concurrency > 1``,
+       and the run is refused when concurrency exceeds it (see
+       `Concurrency and workload`_).
+   * - ``--server-commit REV``
+     - *(empty)*
+     - Free-form identifier of the server build under test (e.g. its git
+       commit), recorded verbatim in the results config section.
+   * - ``--server-image IMAGE``
+     - *(empty)*
+     - Free-form identifier of the server container image / environment,
+       recorded verbatim in the results config section.
    * - ``--kvcache-shape-spec SPEC``
      - ``(2,1024,16,8,128):float16:32``
      - KV cache shape spec (see below).
@@ -789,6 +868,161 @@ Options
      - Suppress all progress messages during the run. Only the final
        structured metrics summary is emitted (unless also redirected
        via ``--output``).
+
+
+Concurrency and workload
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default the bench drives one request at a time. ``--concurrency N``
+runs ``N`` worker threads. Each worker owns its **own** MP client and its
+**own** registered KV-cache context, so the workers drive ``N``
+independent transfer lanes:
+
+* **Own client.** Each worker's ZMQ ``DEALER`` socket gets a distinct
+  identity, which the server uses as the affinity key for its
+  transfer thread pool. A single shared client would pin every worker's
+  STORE / RETRIEVE onto one affinity worker and serialize them; distinct
+  identities allow requests to be distributed across the server's
+  affinity workers. The server maps an affinity key to a slot on the
+  key's **first appearance**, round-robin over the pool; the mapping is
+  never removed and slots are never freed, so there is no "free slot"
+  to reclaim. Distinct slots for all ``N`` bench workers are therefore
+  guaranteed under exactly this condition: on a **dedicated server** (no
+  other affinity client has contacted it since it started), the bench's
+  ``N`` fresh identities appear first and ``N <= max_gpu_workers``. The
+  server cannot be queried for ``max_gpu_workers``, so ``--concurrency > 1``
+  requires ``--server-max-gpu-workers``; the run is refused when ``N``
+  exceeds it, and the value is recorded in the results config section.
+  (The bench clients still share one background polling thread — see the
+  throughput caveat under `Output`_.)
+* **Own context (band-size KV cache).** Worker ``w`` registers under
+  ``instance_id = instance_base + w`` (``instance_base`` is a fresh
+  per-run 62-bit nonce, which practically avoids accidentally reusing a
+  prior run's still-registered context) with a KV cache of one **band**
+  (``--num-blocks / N`` blocks). Because the pool is split ``N`` ways
+  rather than replicated, the total registered KV tensor capacity never
+  exceeds the requested pool and stays approximately constant as
+  concurrency grows — the floor division may leave up to ``N - 1``
+  blocks unused (e.g. ``1000 // 3 * 3 = 999``) — while per-client and
+  per-context metadata overhead still scales with ``N``. Each worker
+  addresses only its own tensors, so two workers can never race on the
+  same memory. Each worker also fills its band from its own
+  deterministic seed (``42 + worker_id``), so no two bands hold
+  identical bytes and a retrieve that lands in the wrong worker's band
+  cannot silently pass a checksum comparison.
+* **Sequence space.** Worker ``w`` processes sequence numbers
+  ``start + w``, ``start + w + N``, ... (stride ``N``). Since the cache
+  key is derived from the sequence number, workers never collide on a
+  server-global key.
+
+The run fails fast if the pool cannot be divided — each worker's band must
+be at least one request wide
+(``--num-blocks / --concurrency >= tokens-per-request / --block-size``).
+Reduce ``--concurrency``, raise ``--num-blocks``, or lower ``--num-tokens``
+if you hit this.
+
+``--concurrency 1`` preserves the historical single-client request
+topology and default workload semantics: one client, one registered
+context, and the full pool as the single band (the block-offset formula
+matches the historical one — unit-tested against it). The registered
+``instance_id`` is still the per-run nonce (``instance_base + 0``), not a
+fixed ``0``, so back-to-back single-worker runs do not collide either.
+
+Concurrent runs must be bounded: pass ``--requests M`` (M requests per
+worker) or ``--end N``. Unbounded (forever) runs are only allowed at
+``--concurrency 1``.
+
+Concurrent phases use a two-phase start: every worker thread is created
+first and blocks on a start gate; the wall clock (and the server
+profiler) starts only once all workers have signalled ready, and only
+then is the gate released. Thread-startup skew is therefore excluded
+from the measured wall time, and the run has true ``N``-way overlap from
+the first request onward.
+
+If **any** worker raises, the run fails: the first exception stops the
+remaining workers, teardown still deregisters every context, and the tool
+exits ``1`` with the summary marked invalid (see `Output`_).
+
+Every request must also satisfy the **contract of its workload mode**;
+any violation, operation failure, or RPC timeout aborts the run the same
+way (summary ``Valid: no``, exit ``1``). The failure counters are still
+printed for diagnosis, but an invalid run never reports throughput or
+latency sections:
+
+* In every mode, a LOOKUP timeout or a prefetch-status poll failure is a
+  request failure — a poll timeout is **never** treated as a cache miss.
+* ``store-only`` (and the ``retrieve-only`` pre-warm): every request
+  must be a full miss and STORE successfully; the pass never issues a
+  RETRIEVE. An unexpected hit (for example, keys left over from a
+  previous run) is a contract violation — use a fresh ``--start`` range
+  or restart the server.
+* The measured ``retrieve-only`` pass: every request must be a full hit
+  and RETRIEVE successfully; the pass never issues a STORE.
+* ``pair``: the hit portion must RETRIEVE and the miss portion must
+  STORE successfully, and any checksum mismatch marks the run invalid.
+* A failed or timed-out ``UNREGISTER`` during teardown also invalidates
+  the run: a context the server still holds skews every subsequent run
+  against this server.
+* Some failures also **taint the server**: a prefetch-status poll timeout
+  (the server keeps the prefetch job — ``END_SESSION`` does not cancel it),
+  or a timed-out cleanup RPC (``END_SESSION`` / ``FREE_LOOKUP_LOCKS``,
+  which may leave a session or read locks held). A run nonce avoids id
+  *collisions* across runs but cannot reclaim leaked *resources*, so such a
+  run reports ``Server reuse safe: no`` and the dedicated server **must be
+  restarted** before the next run.
+
+The ``--op`` flag selects what each worker measures:
+
+* ``pair`` (default) — the historical cold STORE then warm RETRIEVE per
+  sequence, with a checksum comparison. Latency-oriented; ``--interval``
+  applies, so its ops/s is interval-bound rather than a true throughput
+  number.
+* ``store-only`` — a single cold STORE pass over unique sequences. No
+  inter-request sleep; use for write throughput.
+* ``retrieve-only`` — read throughput. Runs in two phases separated by a
+  global barrier: **Phase A** pre-warms the cache with a STORE pass across
+  all workers and joins; **Phase B** then measures a warm RETRIEVE pass.
+  The pre-warm is excluded from the reported wall time and from the server
+  profiler, so only the measured retrieves count. Phase B starts only
+  when the pre-warm provably completed: every worker finished all of its
+  expected requests and every one of them was a full-miss, successful
+  STORE. Any pre-warm failure, timeout, or short completion aborts the
+  run as invalid before a single measured RETRIEVE is issued.
+
+For a concurrency sweep, run the command once per level from a shell loop
+and collect the ``--format json`` output. Pass the server's actual
+``max_gpu_workers`` via ``--server-max-gpu-workers`` — a level whose ``N``
+exceeds it is refused. Give each level a
+**non-overlapping** ``--start`` so the sequence numbers (and therefore the
+cache keys) never collide between levels — otherwise a later level would
+warm-hit data an earlier level already stored and its "cold" STORE pass
+would measure retrieves instead:
+
+.. code-block:: bash
+
+   # c=1 uses seqs [0, 200); c=2 uses [10000, 10400); c=4 uses [20000, ...)
+   # Throughput / concurrency runs on cpu need the handle path, so pass
+   # --transfer-mode lmcache_driven (the default cpu auto maps to the
+   # engine-driven data path, which is refused for store-only / N>1).
+   start=0
+   for c in 1 2 4; do
+     lmcache bench server --rpc-url tcp://localhost:5555 \
+         --mode cpu --transfer-mode lmcache_driven \
+         --op store-only --concurrency "$c" --requests 200 \
+         --start "$start" --server-max-gpu-workers 8 \
+         --format json --output "sweep-c$c.json"
+     start=$((start + 10000))
+   done
+
+.. note::
+
+   Restarting the CLI between sweep levels does **not** clear server-side
+   or L2 cache state — the server keeps everything the previous level
+   stored. The non-overlapping ``--start`` above is what keeps the levels
+   independent. A future revision may add ``--cache-salt`` / ``--run-id``
+   flags to namespace cache keys per run automatically; until then, manage
+   the key space yourself with ``--start``, or restart the server between
+   sweeps if you need a truly cold cache.
 
 
 CPU mode (no GPU)
@@ -898,12 +1132,35 @@ Output
 After the run completes (or is interrupted with ``Ctrl-C``), a structured
 metrics summary is printed. The summary includes:
 
-* **Configuration** -- RPC URL, mode, transfer mode, tokens per request,
-  interval.
-* **Results** -- total requests, checksum OK / FAIL counts, pass rate.
+* **Configuration** -- RPC URL, mode, transfer mode, op, concurrency,
+  tokens per request, interval, the ``instance_id_base`` run nonce (the
+  base of every worker's registered context id), and the
+  operator-supplied server metadata: ``server_max_gpu_workers``
+  (``unknown`` when not given) plus ``server_commit`` / ``server_image``
+  when provided, so a result file is attributable to a specific server
+  configuration.
+* **Results** -- whether the run is valid, completed-vs-expected worker
+  counts, total requests, and STORE / RETRIEVE failure accounting
+  (attempted / OK / failed / timeouts for whichever operations the
+  workload issued). Pair mode additionally reports checksum OK / FAIL
+  counts and pass rate. If a worker aborted, an ``Error`` row is shown and
+  the throughput / latency sections are omitted (the run is invalid).
+* **Throughput** -- measured-phase wall time, requests/s, the number of
+  MB **successfully** stored / retrieved, and store / retrieve MB/s. Only
+  successful transfers count toward the bytes; failed or timed-out ones
+  are excluded. ops/s and MB/s divide by the measured-phase wall time only
+  (the one-time register / unregister, and for ``retrieve-only`` the
+  pre-warm, are excluded). These are **client-observed end-to-end**
+  numbers, not a pure server-side measurement: all ``N`` bench workers
+  share a single background ZMQ polling thread that serializes message
+  send / receive and encode / decode, which can become the client-side
+  ceiling at high concurrency. If MB/s plateaus as ``N`` grows, record
+  the bench process's polling-thread CPU usage before concluding that
+  the server saturated.
 * **Latency sections** -- per-operation latency statistics (count, mean,
-  min, max, p50, p99) for cold lookup, cold store, warm lookup, and warm
-  retrieve.
+  min, max, p50, p95, p99) for cold lookup, cold store, warm lookup, and
+  warm retrieve. Under concurrency the percentiles are pooled across all
+  workers.
 
 Use ``--format json`` to get machine-readable output, or ``--output FILE``
 to save the summary to a file.
@@ -915,19 +1172,42 @@ to save the summary to a file.
    RPC URL:                          tcp://localhost:15556
    Mode:                             gpu
    Transfer mode:                    auto
+   Op:                               pair
+   Concurrency:                      1
    Tokens / request:                 512
    Interval (s):                     0.5
+   Instance ID base:                 1234567890
+   Server max GPU workers:           unknown
    ------------------------- Results --------------------
+   Valid:                            yes
+   Completed workers:                1
+   Expected workers:                 1
    Total requests:                   3
+   Store attempted:                  3
+   Store OK:                         3
+   Store failed:                     0
+   Store timeouts:                   0
+   Retrieve attempted:               3
+   Retrieve OK:                      3
+   Retrieve failed:                  0
+   Retrieve timeouts:                0
    Checksum OK:                      3
    Checksum FAIL:                    0
    Pass rate (%):                    100.0
+   ----------------------- Throughput -------------------
+   Wall time (s):                    3.041
+   Successful store (MB):            65.6
+   Successful retrieve (MB):         65.6
+   Requests/s:                       0.99
+   Store MB/s:                       21.6
+   Retrieve MB/s:                    21.6
    -------------------- Cold Lookup (ms) ---------------
    count:                            3
    mean:                             1.647
    min:                              1.312
    max:                              1.823
    p50:                              1.647
+   p95:                              1.823
    p99:                              1.823
    --------------------- Cold Store (ms) ---------------
    count:                            3
@@ -935,6 +1215,7 @@ to save the summary to a file.
    min:                              1.521
    max:                              1.982
    p50:                              1.740
+   p95:                              1.982
    p99:                              1.982
    -------------------- Warm Lookup (ms) ---------------
    count:                            3
@@ -942,6 +1223,7 @@ to save the summary to a file.
    min:                              1.102
    max:                              1.512
    p50:                              1.310
+   p95:                              1.512
    p99:                              1.512
    ------------------- Warm Retrieve (ms) --------------
    count:                            3
@@ -949,6 +1231,7 @@ to save the summary to a file.
    min:                              1.321
    max:                              1.612
    p50:                              1.480
+   p95:                              1.612
    p99:                              1.612
    =====================================================
 
@@ -956,23 +1239,29 @@ to save the summary to a file.
 Example output (progress)
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-During the run, progress messages are printed to stdout (suppressed by
-``-q`` / ``--quiet``):
+During the run, ``pair`` mode prints per-request progress to stdout
+(suppressed by ``-q`` / ``--quiet``). The throughput modes
+(``store-only`` / ``retrieve-only``) stay silent by default so the chatty
+per-request lines do not distort a high-rate run; only the final summary
+is printed. Warnings and checksum mismatches always go to stderr.
 
 .. code-block:: text
 
    Connecting to LMCache MP Server at tcp://localhost:15556 (mode=gpu) ...
    Server chunk_size = 256
    Resolved KV shape spec: (2,1024,16,8,128):float16:32
-   [seq=0] LOOKUP cold:  0/2 chunks hit (1.82 ms)
-   [seq=0] STORE:        2 chunks stored (1.74 ms)
-   [seq=0] LOOKUP warm:  2/2 chunks hit (1.31 ms)
-   [seq=0] RETRIEVE:     2 chunks retrieved (1.48 ms)
-   [seq=0] CHECKSUM MATCH OK
-   [seq=1] ...
+   === [w0] Request seq=0 ===
+     [w0 seq 0/cold] LOOKUP: 0/2 chunks hit (1.8 ms)
+     [w0 seq 0/cold] STORE: stored (512 tokens, 1.7 ms)
+     [w0 seq 0/warm] LOOKUP: 2/2 chunks hit (1.3 ms)
+     [w0 seq 0/warm] RETRIEVE: retrieved (512 tokens, 1.5 ms)
+     [w0 seq 0] CHECKSUM MATCH OK
+   === [w0] Request seq=1 ===
+   ...
 
-Any ``CHECKSUM MISMATCH``, ``ERROR``, or Python traceback in the log
-indicates a real problem worth investigating.
+The ``w0`` prefix is the worker index; under ``--concurrency N`` the lines
+from all workers interleave. Any ``CHECKSUM MISMATCH``, ``ERROR``, or
+Python traceback (on stderr) indicates a real problem worth investigating.
 
 
 Exit codes
@@ -985,11 +1274,14 @@ Exit codes
    * - Code
      - Meaning
    * - ``0``
-     - Test loop completed (or was interrupted cleanly with Ctrl-C)
-       with no checksum mismatches.
+     - All workers completed (or the run was interrupted cleanly with
+       Ctrl-C) with no worker errors.
    * - ``1``
-     - Fatal error (for example, CUDA unavailable in ``--mode gpu``,
-       server unreachable, or a checksum mismatch).
+     - Fatal error or an invalid run: CUDA unavailable in ``--mode gpu``,
+       server unreachable, a failed registration, any worker raising,
+       any request-level LOOKUP / prefetch-poll / STORE / RETRIEVE
+       failure or timeout, a workload-contract violation, a checksum
+       mismatch, or a failed teardown ``UNREGISTER``.
 
 .. _lmcache-bench-l2:
 
