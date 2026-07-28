@@ -9,7 +9,10 @@ Covers:
 
 # Standard
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import cast
+import _thread
 import argparse
+import itertools
 import json
 import threading
 
@@ -21,14 +24,25 @@ import zmq
 
 # First Party
 from lmcache.cli.commands.bench import BenchCommand
+from lmcache.cli.commands.bench.server_bench import helpers as sv_helpers
+from lmcache.cli.commands.bench.server_bench import runner as sv_runner
 from lmcache.cli.commands.bench.server_bench.helpers import (
+    RequestResult,
+    ServerTaintedError,
+    ServerTaintedInterrupt,
     _allocate_kv_cache,
     _build_token_ids,
     _make_key,
     _poll_prefetch_status,
+    _process_request,
     _query_checksum,
     _send_lookup,
     _send_unregister_kv_cache,
+)
+from lmcache.cli.commands.bench.server_bench.runner import (
+    WorkerRuntime,
+    _worker_seq_numbers,
+    run_concurrent_pairs,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocols.base import RequestType
@@ -623,3 +637,669 @@ class TestUnregisterKVCache:
             client.close()
         finally:
             router.stop()
+
+
+# ------------------------------------------------------------------ #
+#  _process_request lifecycle matrix (fail-close + submit-then-unknown)
+# ------------------------------------------------------------------ #
+
+# Stand-in client: every RPC is injected by patching ``sv_helpers._call``,
+# so nothing is ever called on the client object itself.
+_DUMMY_CLIENT = cast(MessageQueueClient, object())
+
+
+def _dispatching_call(behavior, calls=None):
+    """Build a ``_call`` replacement that dispatches on request type.
+
+    ``behavior`` maps ``RequestType`` -> value | callable(payloads) -> value.
+    A callable may raise to inject an exception / Ctrl-C at the real RPC
+    wait point. The sentinel ``sv_helpers._TIMEOUT`` simulates an RPC
+    timeout; unlisted types reply void (``None``). Every request type is
+    appended to ``calls`` (when given) for issued-operation assertions.
+    """
+
+    def _fake_call(client, request_type, payloads, timeout_s=10.0):
+        if calls is not None:
+            calls.append(request_type)
+        action = behavior.get(request_type)
+        if callable(action):
+            return action(payloads)
+        return action
+
+    return _fake_call
+
+
+def _pair_kwargs(**overrides):
+    """Baseline kwargs driving _process_request as a handle-mode pair request.
+
+    511 + 1 seq token = 512 tokens = 2 chunks of 256, so a poll hit of 1
+    exercises both the RETRIEVE (hit) and the STORE (miss) leg.
+    """
+    base = dict(
+        num_tokens=511,
+        chunk_size=256,
+        pass_label="cold",
+        http_base="",
+        block_size=16,
+        total_blocks=1024,
+        num_engine_group_infos=1,
+        use_gpu=False,
+        use_handle=True,
+        client_tensors=None,
+        server_pool=None,
+    )
+    base.update(overrides)
+    return base
+
+
+def _success_behavior():
+    """A fully successful handle-mode pair request; rows override one stage."""
+    return {
+        RequestType.LOOKUP: None,
+        RequestType.QUERY_PREFETCH_STATUS: 1,
+        RequestType.RETRIEVE: (0, True),
+        RequestType.STORE: (0, True),
+        RequestType.END_SESSION: None,
+    }
+
+
+def _raise(exc_type):
+    """A ``_call`` action that raises *exc_type* at the RPC wait point."""
+
+    def _action(_payloads):
+        raise exc_type
+
+    return _action
+
+
+class TestProcessRequestLifecycle:
+    """The single-request contract: never a confident-but-wrong result.
+
+    Every stateful RPC is submit-then-unknown, so a failure after LOOKUP is
+    submitted invalidates the run (``failure`` set) and, when the server may
+    hold indeterminate state, taints it (``server_tainted``); a body error or
+    a cleanup that cannot be acknowledged is raised as ``ServerTaintedError``
+    / ``ServerTaintedInterrupt``. ``None`` is returned only for a legal skip
+    before any RPC is submitted.
+    """
+
+    def test_legal_skip_returns_none_without_any_rpc(self, monkeypatch) -> None:
+        calls: list = []
+        monkeypatch.setattr(sv_helpers, "_call", _dispatching_call({}, calls))
+        # 0 tokens -> a single seq token -> fewer than one full chunk.
+        result = _process_request(_DUMMY_CLIENT, 0, **_pair_kwargs(num_tokens=0))
+        assert result is None
+        assert calls == []
+
+    def test_success_is_valid_and_untainted(self, monkeypatch) -> None:
+        calls: list = []
+        monkeypatch.setattr(
+            sv_helpers, "_call", _dispatching_call(_success_behavior(), calls)
+        )
+        result = _process_request(_DUMMY_CLIENT, 0, **_pair_kwargs())
+        assert result is not None
+        assert result.failure == ""
+        assert result.server_tainted is False
+        # The pair request retrieves the hit, stores the miss, ends session.
+        assert RequestType.RETRIEVE in calls
+        assert RequestType.STORE in calls
+        assert RequestType.END_SESSION in calls
+
+    @pytest.mark.parametrize(
+        "inject, failure_substr, tainted",
+        [
+            ({RequestType.LOOKUP: sv_helpers._TIMEOUT}, "LOOKUP timeout", True),
+            (
+                {RequestType.QUERY_PREFETCH_STATUS: sv_helpers._TIMEOUT},
+                "prefetch status poll failed",
+                True,
+            ),
+            ({RequestType.RETRIEVE: (0, False)}, "RETRIEVE retrieve_failed", False),
+            ({RequestType.STORE: (0, False)}, "STORE store_failed", False),
+            (
+                {RequestType.END_SESSION: sv_helpers._TIMEOUT},
+                "END_SESSION timeout",
+                True,
+            ),
+        ],
+        ids=[
+            "lookup_timeout",
+            "poll_failure",
+            "retrieve_failure",
+            "store_failure",
+            "end_session_timeout",
+        ],
+    )
+    def test_failure_rows_invalidate_and_maybe_taint(
+        self, monkeypatch, inject, failure_substr, tainted
+    ) -> None:
+        calls: list = []
+        behavior = _success_behavior()
+        behavior.update(inject)
+        monkeypatch.setattr(sv_helpers, "_call", _dispatching_call(behavior, calls))
+        result = _process_request(_DUMMY_CLIENT, 0, **_pair_kwargs())
+        # A post-LOOKUP failure is a RequestResult with a reason -- never a
+        # bare None and never a silent success.
+        assert result is not None
+        assert failure_substr in result.failure
+        assert result.server_tainted is tainted
+        # END_SESSION cleanup is attempted on every post-LOOKUP exit.
+        assert RequestType.END_SESSION in calls
+
+    @pytest.mark.parametrize(
+        "inject, exc_type",
+        [
+            ({RequestType.END_SESSION: _raise(RuntimeError)}, ServerTaintedError),
+            (
+                {RequestType.END_SESSION: _raise(KeyboardInterrupt)},
+                ServerTaintedInterrupt,
+            ),
+            (
+                {RequestType.QUERY_PREFETCH_STATUS: _raise(RuntimeError)},
+                ServerTaintedError,
+            ),
+            (
+                {RequestType.QUERY_PREFETCH_STATUS: _raise(KeyboardInterrupt)},
+                ServerTaintedInterrupt,
+            ),
+        ],
+        ids=[
+            "end_session_exception",
+            "end_session_ctrl_c",
+            "body_exception_mid_poll",
+            "body_ctrl_c_mid_poll",
+        ],
+    )
+    def test_taint_rows_raise_through_producer(
+        self, monkeypatch, inject, exc_type
+    ) -> None:
+        behavior = _success_behavior()
+        behavior.update(inject)
+        monkeypatch.setattr(sv_helpers, "_call", _dispatching_call(behavior))
+        with pytest.raises(exc_type):
+            _process_request(_DUMMY_CLIENT, 0, **_pair_kwargs())
+
+    def test_ctrl_c_taint_keeps_interrupt_semantics(self, monkeypatch) -> None:
+        # ServerTaintedInterrupt subclasses KeyboardInterrupt, so the run
+        # still exits 130 while flagging the server unsafe to reuse; the
+        # original interrupt is chained.
+        behavior = _success_behavior()
+        behavior[RequestType.END_SESSION] = _raise(KeyboardInterrupt)
+        monkeypatch.setattr(sv_helpers, "_call", _dispatching_call(behavior))
+        with pytest.raises(ServerTaintedInterrupt) as ei:
+            _process_request(_DUMMY_CLIENT, 0, **_pair_kwargs())
+        assert isinstance(ei.value, KeyboardInterrupt)
+        assert isinstance(ei.value.__cause__, KeyboardInterrupt)
+
+
+# ------------------------------------------------------------------ #
+#  Concurrent runner (barrier / band / verdict / teardown)
+# ------------------------------------------------------------------ #
+
+
+def _ok_cold(wc) -> RequestResult:
+    """A clean cold (STORE) pass: full miss, two chunks stored."""
+    return RequestResult(checksums=["a", "b"], total_chunks=2, hit_chunks=0)
+
+
+def _ok_warm(wc) -> RequestResult:
+    """A clean warm (RETRIEVE) pass: full hit, digests match the cold pass."""
+    return RequestResult(checksums=["a", "b"], total_chunks=2, hit_chunks=2)
+
+
+class _FakeRuntime:
+    """A fake :class:`WorkerRuntime` recording orchestration for assertions.
+
+    The runner is exercised through its public entry with these fakes, so the
+    tests verify the concurrency contract (bands, barrier, verdict, teardown)
+    without a real client or RPC. Behaviour is configured per row.
+    """
+
+    def __init__(
+        self,
+        *,
+        cold=_ok_cold,
+        warm=_ok_warm,
+        setup_fail_workers=(),
+        request_raise=None,
+        unregister_ack=True,
+        unregister_raise=False,
+        event_log=None,
+    ) -> None:
+        self.setup_calls: list = []
+        self.request_calls: list = []
+        self.unregister_calls: list = []
+        self.close_calls: list = []
+        self.clients: dict = {}
+        self.instance_ids: dict = {}
+        self.bands: dict = {}
+        self.setups_at_first_request: "int | None" = None
+        self._cold = cold
+        self._warm = warm
+        self._setup_fail_workers = set(setup_fail_workers)
+        self._request_raise = request_raise or {}
+        self._unregister_ack = unregister_ack
+        self._unregister_raise = unregister_raise
+        # Optional thread-safe sink recording "setup:w" / "request:w" /
+        # "close:w" so a test can assert the measured-window ordering.
+        self._event_log = event_log
+
+    def _log(self, tag: str) -> None:
+        if self._event_log is not None:
+            self._event_log(tag)
+
+    def as_runtime(self) -> WorkerRuntime:
+        return WorkerRuntime(
+            setup=self.setup,
+            process_request=self.process_request,
+            unregister=self.unregister,
+            close=self.close,
+        )
+
+    def setup(self, wc) -> None:
+        self.setup_calls.append(wc.worker_id)
+        self.instance_ids[wc.worker_id] = wc.instance_id
+        self.bands[wc.worker_id] = (wc.band_base, wc.band_blocks)
+        self._log("setup:%d" % wc.worker_id)
+        # REGISTER is marked possibly-submitted before it can time out.
+        wc.registered_maybe = True
+        if wc.worker_id in self._setup_fail_workers:
+            raise RuntimeError("REGISTER timed out for worker %d" % wc.worker_id)
+        wc.client = object()
+        self.clients[wc.worker_id] = wc.client
+
+    def process_request(self, wc, seq_no, pass_label):
+        if self.setups_at_first_request is None:
+            self.setups_at_first_request = len(set(self.setup_calls))
+        self.request_calls.append((wc.worker_id, seq_no, pass_label))
+        self._log("request:%d" % wc.worker_id)
+        exc = self._request_raise.get((wc.worker_id, pass_label))
+        if exc is None:
+            exc = self._request_raise.get(wc.worker_id)
+        if exc is not None:
+            raise exc
+        maker = self._cold if pass_label == "cold" else self._warm
+        return maker(wc)
+
+    def unregister(self, wc) -> bool:
+        self.unregister_calls.append(wc.worker_id)
+        if self._unregister_raise:
+            raise RuntimeError("UNREGISTER raised for worker %d" % wc.worker_id)
+        return self._unregister_ack
+
+    def close(self, wc) -> None:
+        self.close_calls.append(wc.worker_id)
+        self._log("close:%d" % wc.worker_id)
+
+
+class TestConcurrentRunner:
+    """The concurrency contract: private state, a gated measured phase, and a
+    verdict that never reports a confident-but-wrong or unsafe run."""
+
+    def test_n1_success(self) -> None:
+        rt = _FakeRuntime()
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=1,
+            end=3,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert res.verdict.valid
+        assert res.verdict.server_reuse_safe
+        assert not res.interrupted
+        assert res.stats.total_requests == 3
+        assert res.stats.checksum_ok == 3
+
+    def test_n2_success_distinct_clients_and_instance_ids(self) -> None:
+        rt = _FakeRuntime()
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=4,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert res.verdict.valid
+        assert len(set(rt.instance_ids.values())) == 2
+        assert len({id(c) for c in rt.clients.values()}) == 2
+        assert res.stats.total_requests == 4
+
+    def test_n2_non_overlapping_bands(self) -> None:
+        rt = _FakeRuntime()
+        run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=2,
+            total_blocks=1000,
+            request_blocks=32,
+        )
+        # 1000 // 2 = 500 blocks per band, adjacent and non-overlapping.
+        assert rt.bands[0] == (0, 500)
+        assert rt.bands[1] == (500, 500)
+
+    def test_requests_start_only_after_all_setup(self) -> None:
+        rt = _FakeRuntime()
+        run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=2,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        # The start barrier gates the workload: both workers finished setup
+        # before the first request was issued.
+        assert rt.setups_at_first_request == 2
+
+    def test_setup_failure_aborts_without_deadlock(self) -> None:
+        rt = _FakeRuntime(setup_fail_workers=(0,))
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=2,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        # The run is invalid and no request was issued (the workload never
+        # started); the test completing at all proves no deadlock.
+        assert not res.verdict.valid
+        assert rt.request_calls == []
+
+    def test_one_worker_invalid_run_invalid_but_reuse_safe(self) -> None:
+        def _bad_warm(wc):
+            if wc.worker_id == 1:
+                return RequestResult(total_chunks=2, failure="RETRIEVE retrieve_failed")
+            return _ok_warm(wc)
+
+        rt = _FakeRuntime(warm=_bad_warm)
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=2,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert not res.verdict.valid
+        # A plain request failure invalidates the run but does not taint.
+        assert res.verdict.server_reuse_safe
+
+    def test_one_worker_tainted_run_tainted(self) -> None:
+        def _tainted_cold(wc):
+            if wc.worker_id == 0:
+                return RequestResult(
+                    total_chunks=2, failure="LOOKUP timeout", server_tainted=True
+                )
+            return _ok_cold(wc)
+
+        rt = _FakeRuntime(cold=_tainted_cold)
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=2,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert not res.verdict.valid
+        assert not res.verdict.server_reuse_safe
+
+    def test_register_timeout_still_unregisters(self) -> None:
+        rt = _FakeRuntime(setup_fail_workers=(0,))
+        run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=1,
+            end=1,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        # registered_maybe was set before REGISTER timed out, so teardown
+        # still best-effort UNREGISTERs the (possibly created) context.
+        assert 0 in rt.unregister_calls
+
+    def test_unregister_timeout_makes_run_tainted(self) -> None:
+        rt = _FakeRuntime(unregister_ack=False)
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=1,
+            end=1,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert not res.verdict.server_reuse_safe
+
+    def test_worker_exception_is_not_partial_valid(self) -> None:
+        rt = _FakeRuntime(request_raise={0: RuntimeError("boom")})
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=1,
+            end=1,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert not res.verdict.valid
+
+    def test_ctrl_c_keeps_interrupt_semantics(self) -> None:
+        rt = _FakeRuntime(request_raise={0: KeyboardInterrupt()})
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=1,
+            end=1,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert res.interrupted
+        assert not res.verdict.valid
+
+    def test_checksum_mismatch_invalidates_run(self) -> None:
+        def _bad_warm(wc):
+            return RequestResult(checksums=["a", "X"], total_chunks=2, hit_chunks=2)
+
+        rt = _FakeRuntime(warm=_bad_warm)
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=1,
+            end=1,
+            total_blocks=1024,
+            request_blocks=32,
+        )
+        assert not res.verdict.valid
+        assert res.stats.checksum_fail >= 1
+
+    def test_band_too_small_is_rejected(self) -> None:
+        rt = _FakeRuntime()
+        with pytest.raises(ValueError, match="band"):
+            run_concurrent_pairs(
+                rt.as_runtime(),
+                concurrency=4,
+                end=4,
+                total_blocks=100,
+                request_blocks=64,
+            )
+
+    def test_sequence_numbers_are_globally_unique(self) -> None:
+        # Round-robin partitioning of [start, end) gives every worker a
+        # disjoint stride, so no two workers ever share a seq_no -- and
+        # therefore no two requests share a request_id / cache-key namespace.
+        rt = _FakeRuntime()
+        run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=3,
+            total_blocks=4096,
+            request_blocks=32,
+            start=0,
+            end=12,
+        )
+        cold_seqs = [
+            (worker_id, seq_no)
+            for (worker_id, seq_no, pass_label) in rt.request_calls
+            if pass_label == "cold"
+        ]
+        seq_values = [seq_no for (_wid, seq_no) in cold_seqs]
+        # 3 workers round-robin over [0, 12): every seq distinct, all covered.
+        assert len(seq_values) == 12
+        assert set(seq_values) == set(range(12))
+        # Worker w owns the stride start=w, step=concurrency.
+        per_worker: dict[int, list[int]] = {}
+        for worker_id, seq_no in cold_seqs:
+            per_worker.setdefault(worker_id, []).append(seq_no)
+        assert sorted(per_worker[0]) == [0, 3, 6, 9]
+        assert sorted(per_worker[1]) == [1, 4, 7, 10]
+        assert sorted(per_worker[2]) == [2, 5, 8, 11]
+
+    def test_measurement_hooks_bracket_workload_only(self) -> None:
+        # The measured window must open after all setup/REGISTER and close
+        # after all workload but before any teardown/UNREGISTER.
+        events: list = []
+        lock = threading.Lock()
+
+        def _log(tag: str) -> None:
+            with lock:
+                events.append(tag)
+
+        rt = _FakeRuntime(event_log=_log)
+        run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=2,
+            total_blocks=1024,
+            request_blocks=32,
+            on_measure_start=lambda: _log("measure_start"),
+            on_measure_stop=lambda: _log("measure_stop"),
+        )
+        start_idx = events.index("measure_start")
+        stop_idx = events.index("measure_stop")
+        setup_idx = [i for i, e in enumerate(events) if e.startswith("setup:")]
+        request_idx = [i for i, e in enumerate(events) if e.startswith("request:")]
+        teardown_idx = [i for i, e in enumerate(events) if e.startswith("close:")]
+        # setup / REGISTER excluded: all before the window opens.
+        assert max(setup_idx) < start_idx
+        # workload included: every request inside the window.
+        assert all(start_idx < i < stop_idx for i in request_idx)
+        # teardown / UNREGISTER excluded: all after the window closes.
+        assert stop_idx < min(teardown_idx)
+
+    def test_main_thread_ctrl_c_while_orchestrator_waits(self) -> None:
+        # Simulate a Ctrl-C landing on the orchestrator thread (here as it
+        # opens the measured window, with every worker parked at the start
+        # gate): barriers abort, teardown still runs, threads terminate, and
+        # the run is reported interrupted -- never partial-valid.
+        def _interrupt_on_start() -> None:
+            raise KeyboardInterrupt
+
+        rt = _FakeRuntime()
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            end=4,
+            total_blocks=1024,
+            request_blocks=32,
+            on_measure_start=_interrupt_on_start,
+        )
+        assert res.interrupted
+        assert not res.verdict.valid
+        # Both worker threads terminated and tore down (no hang, no leak).
+        assert set(rt.close_calls) == {0, 1}
+        # The workload never started, so nothing partial was measured.
+        assert rt.request_calls == []
+
+    def test_seq_finite_range_round_robin(self) -> None:
+        stop = threading.Event()
+        w0 = list(_worker_seq_numbers(0, 2, start=0, end=5, stop_event=stop))
+        w1 = list(_worker_seq_numbers(1, 2, start=0, end=5, stop_event=stop))
+        assert w0 == [0, 2, 4]
+        assert w1 == [1, 3]
+        # Together the workers cover [0, 5) with no overlap.
+        assert sorted(w0 + w1) == [0, 1, 2, 3, 4]
+
+    def test_seq_infinite_range_is_unbounded(self) -> None:
+        stop = threading.Event()
+        gen = _worker_seq_numbers(0, 2, start=0, end=None, stop_event=stop)
+        # end=None is the legacy infinite run: it yields forever, so take a
+        # bounded prefix rather than draining it.
+        assert list(itertools.islice(gen, 5)) == [0, 2, 4, 6, 8]
+        # Setting the stop flag ends the generator on the next step.
+        stop.set()
+        assert list(gen) == []
+
+    def test_seq_concurrency_one_is_contiguous(self) -> None:
+        stop = threading.Event()
+        seqs = list(_worker_seq_numbers(0, 1, start=0, end=4, stop_event=stop))
+        assert seqs == [0, 1, 2, 3]
+
+    def test_real_main_thread_interrupt_during_orchestrator_wait(
+        self, monkeypatch
+    ) -> None:
+        # A *real* KeyboardInterrupt raised on the main (orchestrator) thread
+        # via _thread.interrupt_main(), fired once a worker signals its
+        # workload has started, while the orchestrator is blocked waiting for
+        # the workers to finish. end=None keeps the workers running so the
+        # orchestrator stays parked on the done barrier until the interrupt.
+        #
+        # interrupt_main() sets a pending exception delivered when the main
+        # thread's blocking wait next returns, so we shorten the barrier
+        # timeout to keep the test fast; the abort / teardown / interrupt path
+        # it exercises is identical at the production timeout.
+        monkeypatch.setattr(sv_runner, "_START_BARRIER_TIMEOUT_S", 1.0)
+        started = threading.Event()
+
+        def _cold_then_interrupt(wc):
+            if not started.is_set():
+                started.set()
+                _thread.interrupt_main()
+            return _ok_cold(wc)
+
+        rt = _FakeRuntime(cold=_cold_then_interrupt)
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            total_blocks=1024,
+            request_blocks=32,
+            start=0,
+            end=None,
+        )
+        assert res.interrupted
+        assert not res.verdict.valid
+        # Both barriers aborted, both worker threads tore down and terminated
+        # (the test returning at all proves there was no deadlock).
+        assert set(rt.close_calls) == {0, 1}
+
+    def test_measurement_start_hook_error_invalidates_and_tears_down(self) -> None:
+        def _boom() -> None:
+            raise RuntimeError("profiler start failed")
+
+        rt = _FakeRuntime()
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            total_blocks=1024,
+            request_blocks=32,
+            start=0,
+            end=2,
+            on_measure_start=_boom,
+        )
+        # A start-hook failure is invalid but not an interrupt; teardown still
+        # runs on the worker threads, and the workload never opened.
+        assert not res.verdict.valid
+        assert not res.interrupted
+        assert set(rt.close_calls) == {0, 1}
+        assert rt.request_calls == []
+
+    def test_measurement_stop_hook_error_invalidates_and_tears_down(self) -> None:
+        def _boom() -> None:
+            raise RuntimeError("profiler stop failed")
+
+        rt = _FakeRuntime()
+        res = run_concurrent_pairs(
+            rt.as_runtime(),
+            concurrency=2,
+            total_blocks=1024,
+            request_blocks=32,
+            start=0,
+            end=2,
+            on_measure_stop=_boom,
+        )
+        # A stop-hook failure invalidates the run but teardown still completes
+        # on the worker threads; the workload had already run.
+        assert not res.verdict.valid
+        assert not res.interrupted
+        assert set(rt.close_calls) == {0, 1}
+        assert len(rt.request_calls) > 0

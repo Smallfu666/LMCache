@@ -682,6 +682,7 @@ def _send_store(
     client_tensors: list["torch.Tensor"] | None = None,
     chunk_size: int = 0,
     server_pool: "mmap.mmap | None" = None,
+    instance_id: int = _INSTANCE_ID,
 ) -> str:
     """Store KV cache blocks. Returns status string.
 
@@ -694,6 +695,12 @@ def _send_store(
     via the slot descriptors returned by ``PREPARE_STORE``, so the
     follow-up ``COMMIT_STORE`` carries an empty payload and the
     server stays on its zero-copy SHM path.
+
+    Args:
+        instance_id: The registered context to store against. Defaults to
+            ``_INSTANCE_ID`` so existing single-context callers are
+            unchanged; the concurrent runner passes each worker's own id so
+            the STORE routes to that worker's context.
     """
     if use_handle is None:
         use_handle = use_gpu
@@ -703,7 +710,7 @@ def _send_store(
         block_ids = list(range(block_offset, block_offset + num_blocks))
         payloads = [
             key,
-            _INSTANCE_ID,
+            instance_id,
             [block_ids] * num_engine_group_infos,
             _make_event_handle(),
         ]
@@ -713,7 +720,7 @@ def _send_store(
         return "stored" if result[1] else "store_failed"
 
     # CPU mode: PREPARE_STORE -> COMMIT_STORE
-    prep = _call(client, RequestType.PREPARE_STORE, [key, _INSTANCE_ID])
+    prep = _call(client, RequestType.PREPARE_STORE, [key, instance_id])
     if prep is _TIMEOUT:
         return "timeout"
     if server_pool is not None and client_tensors is not None and chunk_size > 0:
@@ -733,7 +740,7 @@ def _send_store(
             for slot_view, chunk_idx in zip(slot_views, chunk_indices, strict=False):
                 if 0 <= chunk_idx < len(full_chunks):
                     slot_view.copy_(full_chunks[chunk_idx].view(slot_view.shape))
-    commit = _call(client, RequestType.COMMIT_STORE, [key, _INSTANCE_ID, b""])
+    commit = _call(client, RequestType.COMMIT_STORE, [key, instance_id, b""])
     if commit is _TIMEOUT:
         return "timeout"
     return "stored" if commit else "store_failed"
@@ -751,6 +758,7 @@ def _send_retrieve(
     use_handle: bool | None = None,
     client_tensors: list["torch.Tensor"] | None = None,
     server_pool: "mmap.mmap | None" = None,
+    instance_id: int = _INSTANCE_ID,
 ) -> str:
     """Retrieve KV cache blocks. Returns status.
 
@@ -763,6 +771,12 @@ def _send_retrieve(
     scatters them back into the paged client SHM, so the round-trip
     self-check can run without ``PREPARE_RETRIEVE`` having to ship a
     pickled copy of the chunks.
+
+    Args:
+        instance_id: The registered context to retrieve from. Defaults to
+            ``_INSTANCE_ID`` so existing single-context callers are
+            unchanged; the concurrent runner passes each worker's own id so
+            the RETRIEVE routes to that worker's context.
     """
     if use_handle is None:
         use_handle = use_gpu
@@ -772,7 +786,7 @@ def _send_retrieve(
         block_ids = list(range(block_offset, block_offset + num_blocks))
         payloads = [
             key,
-            _INSTANCE_ID,
+            instance_id,
             [block_ids] * num_engine_group_infos,
             _make_event_handle(),
             0,  # skip_first_n_tokens
@@ -783,7 +797,7 @@ def _send_retrieve(
         return "retrieved" if result[1] else "retrieve_failed"
 
     # CPU mode: PREPARE_RETRIEVE -> COMMIT_RETRIEVE
-    prep = _call(client, RequestType.PREPARE_RETRIEVE, [key, _INSTANCE_ID])
+    prep = _call(client, RequestType.PREPARE_RETRIEVE, [key, instance_id])
     if prep is _TIMEOUT:
         return "timeout"
     if not prep.success:
@@ -803,7 +817,7 @@ def _send_retrieve(
                 )
             except (RuntimeError, ValueError) as exc:
                 print("  [WARNING] retrieve scatter failed: %s" % exc)
-    commit = _call(client, RequestType.COMMIT_RETRIEVE, [key, _INSTANCE_ID])
+    commit = _call(client, RequestType.COMMIT_RETRIEVE, [key, instance_id])
     if commit is _TIMEOUT:
         return "timeout"
     return "retrieved" if commit else "retrieve_failed"
@@ -812,9 +826,22 @@ def _send_retrieve(
 def _send_end_session(
     client: MessageQueueClient,
     request_id: str,
-) -> None:
-    """END_SESSION — clean up server-side session state."""
-    _call(client, RequestType.END_SESSION, [request_id])
+) -> bool:
+    """END_SESSION -- clean up server-side session state.
+
+    Args:
+        client: The MP message-queue client.
+        request_id: The request whose session should be removed.
+
+    Returns:
+        ``True`` if the server acknowledged the call, ``False`` only on an
+        RPC *timeout* (the session may still be held server-side, so the
+        caller must fail the run and treat the server as tainted). A ZMQ /
+        server exception or a ``KeyboardInterrupt`` is *not* folded into
+        ``False`` -- those propagate to the caller's cleanup guard, which
+        turns them into a taint on the exception path.
+    """
+    return _call(client, RequestType.END_SESSION, [request_id]) is not _TIMEOUT
 
 
 # ------------------------------------------------------------------ #
@@ -886,12 +913,46 @@ def _query_checksum(
 # ------------------------------------------------------------------ #
 
 
+class ServerTaintedInterrupt(KeyboardInterrupt):
+    """A Ctrl-C whose request cleanup (END_SESSION) could not be confirmed.
+
+    A :class:`KeyboardInterrupt` subclass, so it keeps interrupt semantics
+    (the run still exits 130) while signalling that the server may hold
+    residual state and must be restarted. Raised from the
+    :func:`_process_request` cleanup guard when an interrupted request could
+    not acknowledge END_SESSION; the runner detects it and reports
+    ``server_reuse_safe: no``.
+    """
+
+
+class ServerTaintedError(RuntimeError):
+    """A request failed *and* its cleanup (END_SESSION) could not be confirmed.
+
+    Raised from :func:`_process_request` on the exception path -- when the
+    request body raised before a :class:`RequestResult` existed and the
+    subsequent END_SESSION timed out or itself raised. It carries the taint
+    out so the runner can both invalidate the run and flag the server for a
+    restart; the original body exception is preserved via ``raise ... from``.
+    """
+
+
 @dataclass
 class RequestResult:
-    """Result of a single request pass (cold or warm).
+    """Result of a single pair request (one LOOKUP + its transfers).
 
-    Carries both the checksum list (for correctness verification) and
-    per-operation latency measurements (for metrics aggregation).
+    Carries the checksum list (for the pair-mode correctness oracle),
+    per-operation latency measurements (for metrics aggregation), and the
+    run-health signals the runner folds into its per-worker verdict.
+
+    Attributes:
+        failure: Non-empty, human-readable reason when this request
+            invalidates the run (a LOOKUP timeout, a prefetch-poll failure,
+            or a STORE / RETRIEVE failure or timeout). The worker aborts
+            (fail-close) on any non-empty value. Empty on success.
+        server_tainted: ``True`` when the request may have left indeterminate
+            server-side state a fresh id cannot avoid (a leaked prefetch job
+            on a poll timeout, or an unacknowledged cleanup). Surfaces as
+            ``server_reuse_safe: no``; the dedicated server must be restarted.
     """
 
     checksums: list[str] | None = None
@@ -902,6 +963,8 @@ class RequestResult:
     total_chunks: int = 0
     store_tokens: int = 0
     retrieve_tokens: int = 0
+    failure: str = ""
+    server_tainted: bool = False
 
 
 def _process_request(
@@ -918,27 +981,48 @@ def _process_request(
     use_handle: bool | None = None,
     client_tensors: list["torch.Tensor"] | None = None,
     server_pool: "mmap.mmap | None" = None,
+    instance_id: int = _INSTANCE_ID,
+    block_base: int = 0,
 ) -> RequestResult | None:
-    """Run the full lookup -> retrieve/store flow.
+    """Run one pair request (LOOKUP -> retrieve hit + store miss) fail-close.
 
-    When ``client_tensors`` is provided (data-mode self-check), the
-    flow gains two extra steps:
+    A pair request retrieves the already-cached chunks and stores the
+    missing ones in a single flow. Every stateful RPC is treated as
+    submit-then-unknown: once it is *submitted* the server may have acted on
+    it whether or not a reply is observed, so the outcome contract is:
 
-    * cold pass: hash the paged block range *before* ``STORE``, so
-      the digest captures the ground-truth KV bytes.
-    * warm pass: zero-fill the same block range *before*
-      ``RETRIEVE``, then hash *after* ``RETRIEVE``. cold == warm
-      proves the server returned the exact bytes we sent.
+    * ``None`` -- and only this -- when the request is a legal skip: fewer
+      than one full chunk, before any stateful RPC is submitted.
+    * ``RequestResult`` with ``failure`` set -- an RPC or correctness
+      failure after LOOKUP was submitted; ``server_tainted`` is also set when
+      the server may hold indeterminate state (a LOOKUP timeout, a
+      prefetch-poll failure, or a cleanup that could not be acknowledged).
+    * ``ServerTaintedError`` / ``ServerTaintedInterrupt`` -- the body raised
+      (an unexpected error or a Ctrl-C) and cleanup could not confirm clean
+      server state; the run is invalid and the server must be restarted.
 
-    Handle mode keeps the historical server-side
-    ``/cache/checksums`` path; client tensors are not consulted (in
-    handle mode the client and server share the same SHM/IPC
-    pages, so a client-side hash equals itself by construction).
+    A LOOKUP creates session state, so END_SESSION runs best-effort in a
+    ``finally`` on every post-submit exit. When ``client_tensors`` is
+    provided (data mode) the cold pass snapshots the block range before
+    STORE and the warm pass zero-fills it before RETRIEVE, so cold == warm
+    proves the server returned the exact bytes. Handle mode uses the
+    server-side ``/cache/checksums`` path.
+
+    Args:
+        instance_id: The registered context this request targets. Defaults
+            to ``_INSTANCE_ID`` for single-context callers; the concurrent
+            runner passes each worker's own id.
+        block_base: First block of the caller's band. The request's block
+            range is confined to ``[block_base, block_base + total_blocks)``,
+            so the concurrent runner (passing its per-worker band start and
+            size) keeps every worker inside its own band.
     """
     token_ids = _build_token_ids(seq_no, num_tokens)
     request_id = "req-%d-%s" % (seq_no, pass_label)
 
-    # Align end to chunk_size (only full chunks)
+    # A request shorter than one full chunk is a legal skip: nothing is
+    # looked up or transferred, so no stateful RPC is submitted and a bare
+    # ``None`` is unambiguous here -- and only here.
     num_full_tokens = (len(token_ids) // chunk_size) * chunk_size
     if num_full_tokens == 0:
         print(
@@ -947,202 +1031,240 @@ def _process_request(
         )
         return None
 
-    # Key for lookup (worker_id=None)
-    lookup_key = _make_key(
-        token_ids,
-        request_id,
-        start=0,
-        end=num_full_tokens,
-    )
-
-    # 1. LOOKUP
-    t0 = time.monotonic()
-    if not _send_lookup(client, lookup_key):
-        print("  [seq %d/%s] LOOKUP timeout" % (seq_no, pass_label))
-        return None
-
-    # 2. QUERY_PREFETCH_STATUS (poll by request_id)
-    hit_chunks = _poll_prefetch_status(client, lookup_key.request_id)
-    if hit_chunks is None:
-        hit_chunks = 0
-
+    lookup_key = _make_key(token_ids, request_id, start=0, end=num_full_tokens)
     total_chunks = num_full_tokens // chunk_size
-    miss_chunks = total_chunks - hit_chunks
-    hit_tokens = hit_chunks * chunk_size
-    lookup_ms = (time.monotonic() - t0) * 1000
-
-    print(
-        "  [seq %d/%s] LOOKUP: %d/%d chunks hit "
-        "(%.1f ms)"
-        % (
-            seq_no,
-            pass_label,
-            hit_chunks,
-            total_chunks,
-            lookup_ms,
-        )
-    )
-
-    # Block offset: each request uses a different block
-    # range so that different requests touch different data.
-    # Wrap with modulo and clamp so the entire range
-    # [block_offset, block_offset + num_blocks) stays
-    # within [0, total_blocks).
     num_blocks = num_full_tokens // block_size
-    usable = max(total_blocks - num_blocks, 1)
-    block_offset = (seq_no * num_blocks) % usable
 
-    # Client-side self-check (data mode only). cold pass: snapshot
-    # ground truth before STORE. warm pass: zero out the slice so
-    # a successful RETRIEVE must overwrite every byte.
-    cold_ground_truth: list[str] | None = None
-    if client_tensors is not None:
-        if pass_label == "cold" and miss_chunks > 0:
+    # Once LOOKUP is submitted the server holds session state (and, on a hit,
+    # read locks) plus a prefetch job, so from here every exit path runs the
+    # ``finally`` cleanup. ``result`` stays None only if the body raises
+    # before building one, which the cleanup guard uses to decide taint.
+    result: RequestResult | None = None
+    t0 = time.monotonic()
+    try:
+        # 1. LOOKUP -- submit-then-unknown: a timeout may still have created
+        #    session / prefetch state, so it fails AND taints.
+        if not _send_lookup(client, lookup_key):
+            print("  [seq %d/%s] LOOKUP timeout" % (seq_no, pass_label))
+            result = RequestResult(
+                total_chunks=total_chunks,
+                failure="LOOKUP timeout (seq %d, %s pass); server effect unknown"
+                % (seq_no, pass_label),
+                server_tainted=True,
+            )
+            return result
+
+        # 2. QUERY_PREFETCH_STATUS. A poll failure is never a miss: the server
+        #    keeps the prefetch job (END_SESSION does not cancel it), so it
+        #    fails AND taints rather than silently returning hit_chunks=0.
+        hit_chunks = _poll_prefetch_status(client, lookup_key.request_id)
+        if hit_chunks is None:
+            print("  [seq %d/%s] prefetch status poll failed" % (seq_no, pass_label))
+            result = RequestResult(
+                total_chunks=total_chunks,
+                failure="prefetch status poll failed (seq %d, %s pass)"
+                % (seq_no, pass_label),
+                server_tainted=True,
+            )
+            return result
+
+        miss_chunks = total_chunks - hit_chunks
+        hit_tokens = hit_chunks * chunk_size
+        lookup_ms = (time.monotonic() - t0) * 1000
+        print(
+            "  [seq %d/%s] LOOKUP: %d/%d chunks hit (%.1f ms)"
+            % (seq_no, pass_label, hit_chunks, total_chunks, lookup_ms)
+        )
+
+        # Block offset: each request uses a different block range so distinct
+        # sequences touch distinct data, wrapped within this caller's band so
+        # the whole range stays in [block_base, block_base + total_blocks).
+        # The concurrent runner passes the worker's own band (total_blocks =
+        # band size, block_base = band start), so requests never cross bands.
+        usable = max(total_blocks - num_blocks, 1)
+        block_offset = block_base + (seq_no * num_blocks) % usable
+
+        # Client-side self-check (data mode only). cold pass: snapshot ground
+        # truth before STORE. warm pass: zero the slice so a real RETRIEVE
+        # must overwrite every byte.
+        cold_ground_truth: list[str] | None = None
+        if client_tensors is not None:
+            if pass_label == "cold" and miss_chunks > 0:
+                store_block_off = block_offset + (hit_tokens // block_size)
+                store_num_blocks = (num_full_tokens - hit_tokens) // block_size
+                cold_ground_truth = _compute_client_checksums(
+                    client_tensors,
+                    store_block_off,
+                    store_num_blocks,
+                    block_size,
+                    chunk_size,
+                )
+            if pass_label == "warm" and hit_chunks > 0:
+                retr_num_blocks = hit_tokens // block_size
+                _zero_fill_client_blocks(client_tensors, block_offset, retr_num_blocks)
+
+        # 3. RETRIEVE hit portion. A non-"retrieved" status fails the run
+        #    (fail-close) so the driver stops rather than measure a broken op.
+        retrieve_ms: float = 0.0
+        store_ms: float = 0.0
+        failure = ""
+        if hit_chunks > 0:
+            retrieve_key = _make_key(
+                token_ids, request_id, start=0, end=hit_tokens, worker_id=0
+            )
+            t1 = time.monotonic()
+            retrieve_status = _send_retrieve(
+                client,
+                retrieve_key,
+                chunk_size,
+                hit_chunks,
+                block_offset=block_offset,
+                block_size=block_size,
+                num_engine_group_infos=num_engine_group_infos,
+                use_gpu=use_gpu,
+                use_handle=use_handle,
+                client_tensors=client_tensors,
+                server_pool=server_pool,
+                instance_id=instance_id,
+            )
+            retrieve_ms = (time.monotonic() - t1) * 1000
+            print(
+                "  [seq %d/%s] RETRIEVE: %s (%d tokens, %.1f ms)"
+                % (seq_no, pass_label, retrieve_status, hit_tokens, retrieve_ms)
+            )
+            if retrieve_status != "retrieved":
+                failure = "RETRIEVE %s (seq %d, %s pass)" % (
+                    retrieve_status,
+                    seq_no,
+                    pass_label,
+                )
+
+        # 4. STORE miss portion (skipped once the pass already failed).
+        if not failure and miss_chunks > 0:
+            store_start = hit_tokens
+            store_end = num_full_tokens
+            store_key = _make_key(
+                token_ids, request_id, start=store_start, end=store_end, worker_id=0
+            )
+            t2 = time.monotonic()
             store_block_off = block_offset + (hit_tokens // block_size)
-            store_num_blocks = (num_full_tokens - hit_tokens) // block_size
-            cold_ground_truth = _compute_client_checksums(
-                client_tensors,
-                store_block_off,
-                store_num_blocks,
-                block_size,
-                chunk_size,
+            store_status = _send_store(
+                client,
+                store_key,
+                block_offset=store_block_off,
+                block_size=block_size,
+                num_engine_group_infos=num_engine_group_infos,
+                use_gpu=use_gpu,
+                use_handle=use_handle,
+                client_tensors=client_tensors,
+                chunk_size=chunk_size,
+                server_pool=server_pool,
+                instance_id=instance_id,
             )
-        if pass_label == "warm" and hit_chunks > 0:
-            retr_num_blocks = hit_tokens // block_size
-            _zero_fill_client_blocks(
-                client_tensors,
-                block_offset,
-                retr_num_blocks,
+            store_ms = (time.monotonic() - t2) * 1000
+            print(
+                "  [seq %d/%s] STORE: %s (%d tokens, %.1f ms)"
+                % (seq_no, pass_label, store_status, store_end - store_start, store_ms)
+            )
+            if store_status != "stored":
+                failure = "STORE %s (seq %d, %s pass)" % (
+                    store_status,
+                    seq_no,
+                    pass_label,
+                )
+
+        # 5. Checksums (skipped once the pass failed). data mode: cold ==
+        #    warm proves the exact bytes round-tripped; handle mode queries
+        #    the server-side /cache/checksums endpoint.
+        checksums: list[str] | None = None
+        if not failure:
+            if client_tensors is not None and num_full_tokens > 0:
+                if pass_label == "cold":
+                    checksums = cold_ground_truth
+                elif pass_label == "warm" and hit_chunks > 0:
+                    retr_num_blocks = hit_tokens // block_size
+                    checksums = _compute_client_checksums(
+                        client_tensors,
+                        block_offset,
+                        retr_num_blocks,
+                        block_size,
+                        chunk_size,
+                    )
+            elif http_base and num_full_tokens > 0:
+                checksums = _query_checksum(
+                    http_base, block_offset, num_blocks, block_size, chunk_size
+                )
+        if checksums:
+            digest = hashlib.md5("".join(checksums).encode()).hexdigest()[:16]
+            print(
+                "  [seq %d/%s] CHECKSUM: %s (%d chunks)"
+                % (seq_no, pass_label, digest, len(checksums))
             )
 
-    # 3. RETRIEVE hit portion
-    retrieve_ms: float = 0.0
-    store_ms: float = 0.0
-    if hit_chunks > 0:
-        retrieve_key = _make_key(
-            token_ids,
-            request_id,
-            start=0,
-            end=hit_tokens,
-            worker_id=0,
+        result = RequestResult(
+            checksums=checksums,
+            lookup_ms=lookup_ms,
+            retrieve_ms=retrieve_ms if hit_chunks > 0 else None,
+            store_ms=store_ms if miss_chunks > 0 else None,
+            hit_chunks=hit_chunks,
+            total_chunks=total_chunks,
+            store_tokens=(num_full_tokens - hit_tokens)
+            if (not failure and miss_chunks > 0)
+            else 0,
+            retrieve_tokens=hit_tokens if (not failure and hit_chunks > 0) else 0,
+            failure=failure,
         )
-        t1 = time.monotonic()
-        status = _send_retrieve(
-            client,
-            retrieve_key,
-            chunk_size,
-            hit_chunks,
-            block_offset=block_offset,
-            block_size=block_size,
-            num_engine_group_infos=num_engine_group_infos,
-            use_gpu=use_gpu,
-            use_handle=use_handle,
-            client_tensors=client_tensors,
-            server_pool=server_pool,
-        )
-        retrieve_ms = (time.monotonic() - t1) * 1000
-        print(
-            "  [seq %d/%s] RETRIEVE: %s "
-            "(%d tokens, %.1f ms)"
-            % (
-                seq_no,
-                pass_label,
-                status,
-                hit_tokens,
-                retrieve_ms,
-            )
-        )
-
-    # 4. STORE miss portion
-    if miss_chunks > 0:
-        store_start = hit_tokens
-        store_end = num_full_tokens
-        store_key = _make_key(
-            token_ids,
-            request_id,
-            start=store_start,
-            end=store_end,
-            worker_id=0,
-        )
-        t2 = time.monotonic()
-        store_block_off = block_offset + (hit_tokens // block_size)
-        status = _send_store(
-            client,
-            store_key,
-            block_offset=store_block_off,
-            block_size=block_size,
-            num_engine_group_infos=num_engine_group_infos,
-            use_gpu=use_gpu,
-            use_handle=use_handle,
-            client_tensors=client_tensors,
-            chunk_size=chunk_size,
-            server_pool=server_pool,
-        )
-        store_ms = (time.monotonic() - t2) * 1000
-        print(
-            "  [seq %d/%s] STORE: %s "
-            "(%d tokens, %.1f ms)"
-            % (
-                seq_no,
-                pass_label,
-                status,
-                store_end - store_start,
-                store_ms,
-            )
-        )
-
-    # 5. Compute checksums.
-    #   * data mode (client_tensors set):
-    #       cold -> ground truth captured pre-STORE
-    #       warm -> hash post-RETRIEVE; cold == warm proves the
-    #               server returned the exact bytes we wrote.
-    #   * handle mode: query /cache/checksums on the server, which
-    #     reads the shared SHM/IPC pages directly.
-    checksums: list[str] | None = None
-    if client_tensors is not None and num_full_tokens > 0:
-        if pass_label == "cold":
-            checksums = cold_ground_truth
-        elif pass_label == "warm" and hit_chunks > 0:
-            retr_num_blocks = hit_tokens // block_size
-            checksums = _compute_client_checksums(
-                client_tensors,
-                block_offset,
-                retr_num_blocks,
-                block_size,
-                chunk_size,
-            )
-    elif http_base and num_full_tokens > 0:
-        checksums = _query_checksum(
-            http_base,
-            block_offset,
-            num_blocks,
-            block_size,
-            chunk_size,
-        )
-    if checksums:
-        digest = hashlib.md5("".join(checksums).encode()).hexdigest()[:16]
-        print(
-            "  [seq %d/%s] CHECKSUM: %s (%d chunks)"
-            % (
-                seq_no,
-                pass_label,
-                digest,
-                len(checksums),
-            )
-        )
-
-    # 6. END_SESSION
-    _send_end_session(client, request_id)
-    return RequestResult(
-        checksums=checksums,
-        lookup_ms=lookup_ms,
-        retrieve_ms=retrieve_ms if hit_chunks > 0 else None,
-        store_ms=store_ms if miss_chunks > 0 else None,
-        hit_chunks=hit_chunks,
-        total_chunks=total_chunks,
-        store_tokens=(num_full_tokens - hit_tokens) if miss_chunks > 0 else 0,
-        retrieve_tokens=hit_tokens if hit_chunks > 0 else 0,
-    )
+        return result
+    finally:
+        # END_SESSION is itself submit-then-unknown: _call converts only a
+        # TimeoutError to the _TIMEOUT sentinel, so a ZMQ / server exception
+        # or a Ctrl-C while awaiting the reply propagates. Guard it so a
+        # raised cleanup becomes an explicit taint instead of dropping the
+        # verdict (and, on the body-exception path, masking the body error).
+        try:
+            end_ok = _send_end_session(client, request_id)
+        except KeyboardInterrupt as exc:
+            raise ServerTaintedInterrupt(
+                "interrupted while ending session (seq %d, %s pass); server "
+                "effect unknown, restart required" % (seq_no, pass_label)
+            ) from exc
+        except Exception as exc:
+            raise ServerTaintedError(
+                "END_SESSION failed with unknown server state (seq %d, %s "
+                "pass); restart required" % (seq_no, pass_label)
+            ) from exc
+        if result is not None:
+            # The body produced a result. Only a failed END_SESSION adds
+            # taint here; a successful one leaves the result's verdict intact.
+            if not end_ok:
+                result.server_tainted = True
+                result.failure = result.failure or (
+                    "END_SESSION timeout (seq %d, %s pass); server tainted, "
+                    "restart required" % (seq_no, pass_label)
+                )
+        else:
+            # The body raised before producing a result: the request was cut
+            # off in flight, so its server-side effects are indeterminate even
+            # if END_SESSION acked. Taint regardless, chaining the body error.
+            body_exc = sys.exc_info()[1]
+            if not end_ok:
+                reason = (
+                    "%s and END_SESSION timed out (seq %d, %s pass); server "
+                    "restart required"
+                )
+            else:
+                reason = (
+                    "%s mid-request; END_SESSION acked but prefetch job / read "
+                    "locks / pending transfer may remain (seq %d, %s pass); "
+                    "server restart required"
+                )
+            if isinstance(body_exc, KeyboardInterrupt):
+                raise ServerTaintedInterrupt(
+                    reason % ("interrupted", seq_no, pass_label)
+                ) from body_exc
+            raise ServerTaintedError(
+                reason % ("request failed", seq_no, pass_label)
+            ) from body_exc
 
 
 # ------------------------------------------------------------------ #
